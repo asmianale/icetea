@@ -167,9 +167,16 @@ class Bot:
                     self.sl_target = r[-1]["h"] if self.direction == "SELL" else r[-1]["l"]
                     # Target IRL (Liquidity 15M untuk 1H Bias, Liquidity 1H untuk 4H Bias)
                     self.tp_target = get_liquidity_target(self.c15 if self.mode == "1H_BIAS" else self.c1h, self.direction)
+                    
                     self.state = "WAIT_ENTRY"
                     p = precisions[self.symbol]["tick"]
-                    send_telegram(f"🔔 {self.symbol} {self.direction} ({self.mode})\nentry : {round_v(self.entry_zone, p)}\nSL: {round_v(self.sl_target, p)}\nTP: {round_v(self.tp_target, p)}\nstatus : waiting entry")
+                    
+                    # --- KALKULASI RR UNTUK TELEGRAM ---
+                    jarak_sl = abs(self.entry_zone - self.sl_target)
+                    jarak_tp = abs(self.tp_target - self.entry_zone)
+                    estimasi_rr = round(jarak_tp / jarak_sl, 2) if jarak_sl > 0 else 0
+                    
+                    send_telegram(f"🔔 {self.symbol} {self.direction} ({self.mode})\nentry : {round_v(self.entry_zone, p)}\nSL: {round_v(self.sl_target, p)}\nTP: {round_v(self.tp_target, p)}\nRR : 1:{estimasi_rr}\nstatus : waiting entry")
 
     def logic_entry(self):
         if not self.tp_target: return
