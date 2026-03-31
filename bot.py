@@ -31,7 +31,7 @@ CSV_FILE = "riwayat_trading.csv"
 
 # Variabel PnL Bulanan
 total_pnl, total_wins, total_losses = 0.0, 0, 0
-current_month_str = datetime.now().strftime("%Y-%m") # Contoh: "2026-03"
+current_month_str = datetime.now().strftime("%Y-%m")
 
 # --- UTILS ---
 def sync_time():
@@ -72,7 +72,6 @@ def keep_alive_listenkey():
         try: requests.put(BASE_URL + "/fapi/v1/listenKey", headers={"X-MBX-APIKEY": API_KEY})
         except: pass
 
-# --- FITUR BARU: LOAD MONTHLY PNL ---
 def load_monthly_pnl():
     global total_pnl, total_wins, total_losses, current_month_str
     total_pnl, total_wins, total_losses = 0.0, 0, 0
@@ -83,11 +82,10 @@ def load_monthly_pnl():
     try:
         with open(CSV_FILE, mode='r') as f:
             reader = csv.reader(f)
-            next(reader, None) # Lewati baris header (judul kolom)
+            next(reader, None) 
             for row in reader:
                 if len(row) >= 6:
                     waktu = row[0]
-                    # Cek apakah tanggal di CSV berawalan dengan bulan ini (Contoh: "2026-03")
                     if waktu.startswith(current_month_str):
                         pnl = float(row[3])
                         total_pnl += pnl
@@ -212,35 +210,48 @@ class Engine:
                 self.execute_binance_async(qty, price, self.dir, self.sl, self.tp, self.mode)
                 self.reset()
 
+    # PERBAIKAN FINAL: Eksekusi sekuensial (Satu per satu) agar lolos filter Algo Order Binance
     def execute_binance_async(self, qty, price, direction, sl, tp, mode):
         def run():
             try:
                 pr = precisions[self.symbol]
                 fq, fsl, ftp = round_v(qty, pr["step"]), round_v(sl, pr["tick"]), round_v(tp, pr["tick"])
                 
-                orders = [{"symbol": self.symbol, "side": direction, "type": "MARKET", "quantity": fq},
-                          {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "STOP_MARKET", "stopPrice": fsl, "closePosition": "true"},
-                          {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "TAKE_PROFIT_MARKET", "stopPrice": ftp, "closePosition": "true"}]
+                # Fungsi pembantu untuk menembak API
+                def post_single_order(params):
+                    params["timestamp"] = ts()
+                    query_string = urllib.parse.urlencode(params)
+                    signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+                    headers = {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+                    payload = f"{query_string}&signature={signature}"
+                    return requests.post(f"{BASE_URL}/fapi/v1/order", headers=headers, data=payload).json()
+
+                # 1. Tembak Entry Market
+                entry_params = {"symbol": self.symbol, "side": direction, "type": "MARKET", "quantity": fq}
+                res_entry = post_single_order(entry_params)
                 
-                batch_json = json.dumps(orders, separators=(',', ':'))
-                params = {"batchOrders": batch_json, "timestamp": ts()}
-                query_string = urllib.parse.urlencode(params)
-                signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+                if "code" in res_entry:
+                    send_telegram(f"⚠️ API Error (Entry) {self.symbol}: {res_entry.get('msg')}")
+                    return # Jika entry gagal (misal saldo kurang), stop disini. Jangan pasang TP/SL.
                 
-                headers = {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
-                payload = f"{query_string}&signature={signature}"
+                active_signals[self.symbol] = mode 
+                opp_side = "SELL" if direction == "BUY" else "BUY"
                 
-                res = requests.post(f"{BASE_URL}/fapi/v1/batchOrders", headers=headers, data=payload).json()
-                
-                if isinstance(res, list):
-                    errors = [x for x in res if "code" in x]
-                    if not errors:
-                        active_signals[self.symbol] = mode 
-                        send_telegram(f"🚀 {self.symbol} {direction} EXECUTED ({mode})\nEntry: {round_v(price, pr['tick'])}\nSL: {fsl}\nTP: {ftp}")
-                    else:
-                        send_telegram(f"⚠️ API Error {self.symbol}: {errors[0].get('msg')}")
-                else:
-                    send_telegram(f"⚠️ API Error {self.symbol}: {res.get('msg', 'Unknown Error')}")
+                # 2. Tembak Stop Loss
+                sl_params = {"symbol": self.symbol, "side": opp_side, "type": "STOP_MARKET", "stopPrice": fsl, "closePosition": "true"}
+                res_sl = post_single_order(sl_params)
+                if "code" in res_sl:
+                    send_telegram(f"⚠️ API Error (SL) {self.symbol}: {res_sl.get('msg')}")
+
+                # 3. Tembak Take Profit
+                tp_params = {"symbol": self.symbol, "side": opp_side, "type": "TAKE_PROFIT_MARKET", "stopPrice": ftp, "closePosition": "true"}
+                res_tp = post_single_order(tp_params)
+                if "code" in res_tp:
+                    send_telegram(f"⚠️ API Error (TP) {self.symbol}: {res_tp.get('msg')}")
+
+                # 4. Beri notifikasi sukses ke Telegram
+                send_telegram(f"🚀 {self.symbol} {direction} EXECUTED ({mode})\nEntry: {round_v(price, pr['tick'])}\nSL: {fsl}\nTP: {ftp}")
+
             except Exception as e:
                 send_telegram(f"⚠️ Script Error {self.symbol}: Gagal menghubungi Binance. {e}")
 
@@ -286,7 +297,6 @@ def telegram_cmd():
                         elif config["ENABLE_4H"]: st_mode = "HANYA 4H BIAS"
                         else: st_mode = "SEMUA MATI"
                         
-                        # Menambahkan teks spesifik agar Anda tahu ini adalah rekap bulanan
                         resp = f"📊 PnL Bulan Ini ({current_month_str}): {round(total_pnl, 4)} USDT\nWinrate: {round(wr, 1)}%\nWins: {total_wins} | Loss: {total_losses}\nActive: {len(positions)}\n\n⚙️ Mode Aktif: {st_mode}"
                         requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": resp})
                         
@@ -309,7 +319,7 @@ def telegram_cmd():
 
 def start():
     load_precisions()
-    load_monthly_pnl() # Memuat PnL bulan ini dari CSV saat bot baru nyala
+    load_monthly_pnl() 
     
     for s in symbols:
         for tf in ["4h", "1h", "15m", "5m"]:
@@ -336,12 +346,10 @@ def start():
             if d.get("e") == "ORDER_TRADE_UPDATE" and d["o"]["X"] == "FILLED":
                 rp = float(d["o"].get("rp", 0))
                 if rp != 0: 
-                    # --- CEK PERGANTIAN BULAN SECARA REAL-TIME ---
                     now_ym = datetime.now().strftime("%Y-%m")
                     if now_ym != current_month_str:
-                        total_pnl, total_wins, total_losses = 0.0, 0, 0 # Reset awal bulan!
+                        total_pnl, total_wins, total_losses = 0.0, 0, 0 
                         current_month_str = now_ym
-                    # ---------------------------------------------
                     
                     total_pnl += rp
                     if rp > 0: total_wins += 1
@@ -367,5 +375,5 @@ def start():
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT DUAL-ENGINE v4.5 (MONTHLY PNL TRACKER) ACTIVE...")
+    print("🔥 BOT DUAL-ENGINE v4.6 (ULTIMATE) ACTIVE...")
     while True: time.sleep(1)
