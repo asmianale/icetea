@@ -1,4 +1,4 @@
-import os, time, json, hmac, hashlib, requests, websocket, threading, math, csv
+import os, time, json, hmac, hashlib, requests, websocket, threading, math, csv, urllib.parse
 from dotenv import load_dotenv
 from datetime import datetime
 
@@ -26,7 +26,7 @@ config = {
 }
 
 positions = {}
-active_signals = {} # Menyimpan mode apa yang sedang aktif trading per koin
+active_signals = {} 
 total_pnl, total_wins, total_losses = 0.0, 0, 0
 CSV_FILE = "riwayat_trading.csv"
 
@@ -36,10 +36,8 @@ def sync_time():
     except: return 0
 time_offset = sync_time()
 def ts(): return int(time.time() * 1000 + time_offset)
-def sign(p): return hmac.new(SECRET_KEY.encode(), "&".join([f"{k}={v}" for k, v in p.items()]).encode(), hashlib.sha256).hexdigest()
 
 def send_telegram(msg):
-    # Menggunakan thread agar tidak memblokir WebSocket jika Telegram lambat merespons
     def run():
         t, c = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
         if t and c:
@@ -65,34 +63,37 @@ def log_trade(symbol, side, pnl, mode):
         if not file_exists: w.writerow(['Waktu', 'Simbol', 'Posisi', 'PnL (USDT)', 'Mode', 'Status'])
         w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), symbol, side, round(pnl,4), mode, "WIN" if pnl>0 else "LOSS"])
 
-# --- PING LISTENKEY BINANCE ---
 def keep_alive_listenkey():
-    """Fungsi ini berjalan di background untuk memperpanjang umur ListenKey tiap 45 menit"""
     while True:
-        time.sleep(45 * 60) # Tidur 45 menit
-        try:
-            requests.put(BASE_URL + "/fapi/v1/listenKey", headers={"X-MBX-APIKEY": API_KEY})
+        time.sleep(45 * 60) 
+        try: requests.put(BASE_URL + "/fapi/v1/listenKey", headers={"X-MBX-APIKEY": API_KEY})
         except: pass
 
 # --- SMC LOGIC ---
 def get_unmitigated_poi(c, depth=40, min_size=0.1):
     if len(c) < depth + 2: return [], []
     fvgs, obs = [], []
+    
+    # PERBAIKAN BUG FVG: Cek mitigasi hanya sampai H-1 (len(c)-1), agar sentuhan pertama hari ini terhitung Fresh!
     for i in range(len(c) - depth, len(c) - 2):
-        if c[i]["h"] < c[i+2]["l"]:
+        if c[i]["h"] < c[i+2]["l"]: # BUY FVG
             if ((c[i+2]["l"] - c[i]["h"])/c[i]["h"]*100) >= min_size:
-                if not any(c[j]["l"] <= c[i+2]["l"] for j in range(i+3, len(c))):
+                if not any(c[j]["l"] <= c[i+2]["l"] for j in range(i+3, len(c)-1)):
                     fvgs.append(("BUY", c[i]["h"], c[i+2]["l"]))
-        elif c[i]["l"] > c[i+2]["h"]:
+                    
+        elif c[i]["l"] > c[i+2]["h"]: # SELL FVG
             if ((c[i]["l"] - c[i+2]["h"])/c[i+2]["h"]*100) >= min_size:
-                if not any(c[j]["h"] >= c[i+2]["h"] for j in range(i+3, len(c))):
+                if not any(c[j]["h"] >= c[i+2]["h"] for j in range(i+3, len(c)-1)):
                     fvgs.append(("SELL", c[i+2]["h"], c[i]["l"]))
+                    
         if c[i]["c"] < c[i]["o"] and c[i+1]["c"] > c[i+1]["o"] and (c[i+1]["c"]-c[i+1]["o"]) > abs(c[i]["c"]-c[i]["o"])*1.5:
-            if not any(c[j]["l"] <= c[i]["h"] for j in range(i+2, len(c))):
+            if not any(c[j]["l"] <= c[i]["h"] for j in range(i+2, len(c)-1)):
                 obs.append(("BUY", c[i]["l"], c[i]["h"]))
+                
         elif c[i]["c"] > c[i]["o"] and c[i+1]["c"] < c[i+1]["o"] and (c[i+1]["o"]-c[i+1]["c"]) > abs(c[i]["c"]-c[i]["o"])*1.5:
-            if not any(c[j]["h"] >= c[i]["l"] for j in range(i+2, len(c))):
+            if not any(c[j]["h"] >= c[i]["l"] for j in range(i+2, len(c)-1)):
                 obs.append(("SELL", c[i]["l"], c[i]["h"]))
+                
     return fvgs, obs
 
 def get_target(c, d, depth=15):
@@ -176,7 +177,6 @@ class Engine:
 
         elif self.state == "WAIT_ENTRY":
             if not self.tp: return
-            
             if (self.dir == "SELL" and price <= self.tp) or (self.dir == "BUY" and price >= self.tp):
                 send_telegram(f"❌ {self.symbol} {self.dir} ({self.mode})\nSetup dibatalkan. Harga mencapai TP sebelum menjemput Entry.")
                 self.reset(); return
@@ -186,17 +186,34 @@ class Engine:
                 self.execute_binance_async(qty, price, self.dir, self.sl, self.tp, self.mode)
                 self.reset()
 
+    # PERBAIKAN BUG SIGNATURE: URL Encode ketat sesuai aturan Binance
     def execute_binance_async(self, qty, price, direction, sl, tp, mode):
         def run():
             try:
-                h = {"X-MBX-APIKEY": API_KEY}; pr = precisions[self.symbol]
+                pr = precisions[self.symbol]
                 fq, fsl, ftp = round_v(qty, pr["step"]), round_v(sl, pr["tick"]), round_v(tp, pr["tick"])
+                
                 orders = [{"symbol": self.symbol, "side": direction, "type": "MARKET", "quantity": fq},
                           {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "STOP_MARKET", "stopPrice": fsl, "closePosition": "true"},
                           {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "TAKE_PROFIT_MARKET", "stopPrice": ftp, "closePosition": "true"}]
-                req = {"batchOrders": json.dumps(orders), "timestamp": ts()}; req["signature"] = sign(req)
                 
-                res = requests.post(f"{BASE_URL}/fapi/v1/batchOrders", headers=h, data=req).json()
+                # 1. Hapus spasi dari string JSON
+                batch_json = json.dumps(orders, separators=(',', ':'))
+                
+                # 2. Siapkan parameter mentah
+                params = {"batchOrders": batch_json, "timestamp": ts()}
+                
+                # 3. Ubah ke format URL Query String persis seperti yang akan dikirim
+                query_string = urllib.parse.urlencode(params)
+                
+                # 4. Tanda tangani (Sign) Query String tersebut
+                signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+                
+                # 5. Kirim via header Form-Urlencoded murni
+                headers = {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
+                payload = f"{query_string}&signature={signature}"
+                
+                res = requests.post(f"{BASE_URL}/fapi/v1/batchOrders", headers=headers, data=payload).json()
                 
                 if isinstance(res, list):
                     errors = [x for x in res if "code" in x]
@@ -230,7 +247,6 @@ def on_market_msg(ws, msg):
             if k["x"]: 
                 klines_data[s][tf].append(fk)
                 klines_data[s][tf] = klines_data[s][tf][-60:] 
-            
             for e in engines:
                 if e.symbol == s: e.tick()
 
@@ -248,12 +264,10 @@ def telegram_cmd():
                     
                     if msg == "/pnl":
                         wr = (total_wins/(total_wins+total_losses)*100) if (total_wins+total_losses)>0 else 0
-                        
                         if config["ENABLE_1H"] and config["ENABLE_4H"]: st_mode = "DOUBLE (1H & 4H)"
                         elif config["ENABLE_1H"]: st_mode = "HANYA 1H BIAS"
                         elif config["ENABLE_4H"]: st_mode = "HANYA 4H BIAS"
                         else: st_mode = "SEMUA MATI"
-                        
                         resp = f"📊 PnL: {round(total_pnl, 4)} USDT\nWinrate: {round(wr, 1)}%\nWins: {total_wins} | Loss: {total_losses}\nActive: {len(positions)}\n\n⚙️ Mode Aktif: {st_mode}"
                         requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": resp})
                         
@@ -280,21 +294,21 @@ def start():
         for tf in ["4h", "1h", "15m", "5m"]:
             try:
                 res = requests.get(f"{BASE_URL}/fapi/v1/klines", params={"symbol": s, "interval": tf, "limit": 60}).json()
-                klines_data[s][tf] = [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "x": True} for k in res]
+                klines_data[s][tf] = [
+                    {"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "x": (i < len(res) - 1)} 
+                    for i, k in enumerate(res)
+                ]
             except: pass
     
     threading.Thread(target=telegram_cmd, daemon=True).start()
     streams = "/".join([f"{s.lower()}@kline_{tf}" for s in symbols for tf in ["1m", "5m", "15m", "1h", "4h"]])
     threading.Thread(target=lambda: websocket.WebSocketApp(f"{WS_BASE}/stream?streams={streams}", on_message=on_market_msg).run_forever(ping_interval=60)).start()
     
-    # Dapatkan ListenKey awal
     lk_response = requests.post(BASE_URL + "/fapi/v1/listenKey", headers={"X-MBX-APIKEY": API_KEY}).json()
     lk = lk_response.get("listenKey")
     
     if lk:
-        # Jalankan ping perpanjangan ListenKey di background
         threading.Thread(target=keep_alive_listenkey, daemon=True).start()
-        
         def on_user(ws, m):
             global total_pnl, total_wins, total_losses
             d = json.loads(m)
@@ -318,11 +332,9 @@ def start():
                         positions[s] = {"side": "BUY" if float(p["pa"]) > 0 else "SELL", "qty": abs(float(p["pa"]))}
                         
         threading.Thread(target=lambda: websocket.WebSocketApp(f"{WS_BASE}/ws/{lk}", on_message=on_user).run_forever(ping_interval=60)).start()
-    else:
-        print("Gagal mendapatkan ListenKey. Cek API Key Anda.")
+    else: print("Gagal mendapatkan ListenKey. Cek API Key Anda.")
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT DUAL-ENGINE v4.2 (FINAL STABLE) ACTIVE...")
-    print("Gunakan command di Telegram: /pnl, /mode 1h, /mode 4h, /mode double")
+    print("🔥 BOT DUAL-ENGINE v4.3 (BUGFIX) ACTIVE...")
     while True: time.sleep(1)
