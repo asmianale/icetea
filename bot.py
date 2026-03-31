@@ -27,8 +27,11 @@ config = {
 
 positions = {}
 active_signals = {} 
-total_pnl, total_wins, total_losses = 0.0, 0, 0
 CSV_FILE = "riwayat_trading.csv"
+
+# Variabel PnL Bulanan
+total_pnl, total_wins, total_losses = 0.0, 0, 0
+current_month_str = datetime.now().strftime("%Y-%m") # Contoh: "2026-03"
 
 # --- UTILS ---
 def sync_time():
@@ -69,19 +72,42 @@ def keep_alive_listenkey():
         try: requests.put(BASE_URL + "/fapi/v1/listenKey", headers={"X-MBX-APIKEY": API_KEY})
         except: pass
 
+# --- FITUR BARU: LOAD MONTHLY PNL ---
+def load_monthly_pnl():
+    global total_pnl, total_wins, total_losses, current_month_str
+    total_pnl, total_wins, total_losses = 0.0, 0, 0
+    current_month_str = datetime.now().strftime("%Y-%m")
+    
+    if not os.path.isfile(CSV_FILE): return
+    
+    try:
+        with open(CSV_FILE, mode='r') as f:
+            reader = csv.reader(f)
+            next(reader, None) # Lewati baris header (judul kolom)
+            for row in reader:
+                if len(row) >= 6:
+                    waktu = row[0]
+                    # Cek apakah tanggal di CSV berawalan dengan bulan ini (Contoh: "2026-03")
+                    if waktu.startswith(current_month_str):
+                        pnl = float(row[3])
+                        total_pnl += pnl
+                        if pnl > 0: total_wins += 1
+                        elif pnl < 0: total_losses += 1
+    except Exception as e:
+        print(f"Gagal memuat riwayat PnL bulanan: {e}")
+
 # --- SMC LOGIC ---
 def get_unmitigated_poi(c, depth=40, min_size=0.1):
-    if len(c) < depth + 2: return [], []
+    if len(c) < depth + 3: return [], []
     fvgs, obs = [], []
     
-    # PERBAIKAN BUG FVG: Cek mitigasi hanya sampai H-1 (len(c)-1), agar sentuhan pertama hari ini terhitung Fresh!
-    for i in range(len(c) - depth, len(c) - 2):
-        if c[i]["h"] < c[i+2]["l"]: # BUY FVG
+    for i in range(len(c) - depth, len(c) - 3):
+        if c[i]["h"] < c[i+2]["l"]: 
             if ((c[i+2]["l"] - c[i]["h"])/c[i]["h"]*100) >= min_size:
                 if not any(c[j]["l"] <= c[i+2]["l"] for j in range(i+3, len(c)-1)):
                     fvgs.append(("BUY", c[i]["h"], c[i+2]["l"]))
                     
-        elif c[i]["l"] > c[i+2]["h"]: # SELL FVG
+        elif c[i]["l"] > c[i+2]["h"]: 
             if ((c[i]["l"] - c[i+2]["h"])/c[i+2]["h"]*100) >= min_size:
                 if not any(c[j]["h"] >= c[i+2]["h"] for j in range(i+3, len(c)-1)):
                     fvgs.append(("SELL", c[i+2]["h"], c[i]["l"]))
@@ -186,7 +212,6 @@ class Engine:
                 self.execute_binance_async(qty, price, self.dir, self.sl, self.tp, self.mode)
                 self.reset()
 
-    # PERBAIKAN BUG SIGNATURE: URL Encode ketat sesuai aturan Binance
     def execute_binance_async(self, qty, price, direction, sl, tp, mode):
         def run():
             try:
@@ -197,19 +222,11 @@ class Engine:
                           {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "STOP_MARKET", "stopPrice": fsl, "closePosition": "true"},
                           {"symbol": self.symbol, "side": "SELL" if direction == "BUY" else "BUY", "type": "TAKE_PROFIT_MARKET", "stopPrice": ftp, "closePosition": "true"}]
                 
-                # 1. Hapus spasi dari string JSON
                 batch_json = json.dumps(orders, separators=(',', ':'))
-                
-                # 2. Siapkan parameter mentah
                 params = {"batchOrders": batch_json, "timestamp": ts()}
-                
-                # 3. Ubah ke format URL Query String persis seperti yang akan dikirim
                 query_string = urllib.parse.urlencode(params)
-                
-                # 4. Tanda tangani (Sign) Query String tersebut
                 signature = hmac.new(SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
                 
-                # 5. Kirim via header Form-Urlencoded murni
                 headers = {"X-MBX-APIKEY": API_KEY, "Content-Type": "application/x-www-form-urlencoded"}
                 payload = f"{query_string}&signature={signature}"
                 
@@ -251,7 +268,7 @@ def on_market_msg(ws, msg):
                 if e.symbol == s: e.tick()
 
 def telegram_cmd():
-    global total_pnl, total_wins, total_losses
+    global total_pnl, total_wins, total_losses, current_month_str
     t = os.getenv("TELEGRAM_TOKEN"); lid = 0
     while True:
         try:
@@ -268,7 +285,9 @@ def telegram_cmd():
                         elif config["ENABLE_1H"]: st_mode = "HANYA 1H BIAS"
                         elif config["ENABLE_4H"]: st_mode = "HANYA 4H BIAS"
                         else: st_mode = "SEMUA MATI"
-                        resp = f"📊 PnL: {round(total_pnl, 4)} USDT\nWinrate: {round(wr, 1)}%\nWins: {total_wins} | Loss: {total_losses}\nActive: {len(positions)}\n\n⚙️ Mode Aktif: {st_mode}"
+                        
+                        # Menambahkan teks spesifik agar Anda tahu ini adalah rekap bulanan
+                        resp = f"📊 PnL Bulan Ini ({current_month_str}): {round(total_pnl, 4)} USDT\nWinrate: {round(wr, 1)}%\nWins: {total_wins} | Loss: {total_losses}\nActive: {len(positions)}\n\n⚙️ Mode Aktif: {st_mode}"
                         requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": resp})
                         
                     elif msg == "/mode 1h":
@@ -290,6 +309,8 @@ def telegram_cmd():
 
 def start():
     load_precisions()
+    load_monthly_pnl() # Memuat PnL bulan ini dari CSV saat bot baru nyala
+    
     for s in symbols:
         for tf in ["4h", "1h", "15m", "5m"]:
             try:
@@ -310,12 +331,22 @@ def start():
     if lk:
         threading.Thread(target=keep_alive_listenkey, daemon=True).start()
         def on_user(ws, m):
-            global total_pnl, total_wins, total_losses
+            global total_pnl, total_wins, total_losses, current_month_str
             d = json.loads(m)
             if d.get("e") == "ORDER_TRADE_UPDATE" and d["o"]["X"] == "FILLED":
                 rp = float(d["o"].get("rp", 0))
                 if rp != 0: 
-                    total_pnl += rp; total_wins += 1 if rp > 0 else 0; total_losses += 1 if rp < 0 else 0
+                    # --- CEK PERGANTIAN BULAN SECARA REAL-TIME ---
+                    now_ym = datetime.now().strftime("%Y-%m")
+                    if now_ym != current_month_str:
+                        total_pnl, total_wins, total_losses = 0.0, 0, 0 # Reset awal bulan!
+                        current_month_str = now_ym
+                    # ---------------------------------------------
+                    
+                    total_pnl += rp
+                    if rp > 0: total_wins += 1
+                    elif rp < 0: total_losses += 1
+                    
                     s = d["o"]["s"]
                     side = d["o"]["S"]
                     mode = active_signals.get(s, "UNKNOWN")
@@ -336,5 +367,5 @@ def start():
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT DUAL-ENGINE v4.3 (BUGFIX) ACTIVE...")
+    print("🔥 BOT DUAL-ENGINE v4.5 (MONTHLY PNL TRACKER) ACTIVE...")
     while True: time.sleep(1)
