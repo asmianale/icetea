@@ -21,7 +21,7 @@ klines_data = {s: {"1m": [], "5m": [], "15m": [], "1h": [], "4h": []} for s in s
 live_prices = {s: 0.0 for s in symbols}
 config = {"ENABLE_1H": True, "ENABLE_4H": True}
 positions = {}
-active_signals = {} # Menyimpan data TP untuk dipasang saat Limit Filled
+active_signals = {} 
 CSV_FILE = "riwayat_trading.csv"
 
 total_pnl, total_wins, total_losses = 0.0, 0, 0
@@ -150,16 +150,14 @@ class Engine:
                     if abs(self.tp - self.entry)/abs(self.entry - self.sl) < MIN_RR: self.reset(); return 
                     
                     self.state = "WAIT_ENTRY"
-                    self.place_limit_and_sl_async() # Pasang Limit & SL bersamaan!
+                    self.place_limit_and_sl_async() 
 
         elif self.state == "WAIT_ENTRY":
-            # Batal jika harga mencapai TP sebelum menjemput Limit
             if (self.dir == "SELL" and price <= self.tp) or (self.dir == "BUY" and price >= self.tp):
                 send_telegram(f"❌ {self.symbol} Setup Batal: Harga menyentuh TP sebelum Limit terisi. Menghapus Limit Order...")
                 self.cancel_pending_limit()
                 self.reset()
 
-    # --- FITUR BARU: LIMIT + SL BERSAMAAN DENGAN REDUCE ONLY ---
     def place_limit_and_sl_async(self):
         def run():
             try:
@@ -168,15 +166,12 @@ class Engine:
                 fsl = round_v(self.sl, pr["tick"])
                 opp_side = "SELL" if self.dir == "BUY" else "BUY"
                 
-                # 1. Pasang Limit Order
                 params_limit = {"symbol": self.symbol, "side": self.dir, "type": "LIMIT", "quantity": fq, "price": fe, "timeInForce": "GTC"}
                 res_limit = post_api(params_limit, "/fapi/v1/order")
                 
                 if "orderId" in res_limit:
                     self.pending_order_id = res_limit["orderId"]
                     
-                    # 2. LANGSUNG Pasang Stop Loss (Jalur Normal + Reduce Only + Quantity)
-                    # Tidak menggunakan closePosition agar tidak kena TIF GTE error!
                     params_sl = {
                         "symbol": self.symbol, 
                         "side": opp_side, 
@@ -192,7 +187,6 @@ class Engine:
                     else:
                         send_telegram(f"⚠️ Limit terpasang, tapi API SL Error {self.symbol}: {res_sl.get('msg')}")
 
-                    # Simpan target TP untuk dipasang nanti setelah Limit Filled
                     active_signals[self.symbol] = {"mode": self.mode, "tp": self.tp, "dir": self.dir, "qty": fq}
                     send_telegram(f"⏳ {self.symbol} LIMIT & SL PLACED ({self.mode})\nEntry: {fe}\nSL: {fsl}\nTP: {round_v(self.tp, pr['tick'])} (Menunggu Limit)")
                 else:
@@ -204,16 +198,14 @@ class Engine:
     def cancel_pending_limit(self):
         if self.pending_order_id:
             def run():
-                # Hapus Limit Order
                 post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-                # Hapus Stop Loss yang menggantung (jika ada)
                 if self.pending_sl_id:
                     post_api({"symbol": self.symbol, "orderId": self.pending_sl_id}, "/fapi/v1/order", method="DELETE")
             threading.Thread(target=run, daemon=True).start()
             self.pending_order_id = None
             self.pending_sl_id = None
 
-# --- WS & START ---
+# --- WS & TELEGRAM COMMANDS ---
 def on_market_msg(ws, msg):
     d = json.loads(msg)
     if "data" in d:
@@ -224,21 +216,58 @@ def on_market_msg(ws, msg):
             for e in engines: 
                 if e.symbol == s: e.tick()
 
+# KEMBALINYA TELEGRAM COMMAND!
+def telegram_cmd():
+    global total_pnl, total_wins, total_losses, current_month_str
+    t = os.getenv("TELEGRAM_TOKEN"); lid = 0
+    while True:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{t}/getUpdates?offset={lid}&timeout=10").json()
+            if r.get("ok"):
+                for i in r["result"]:
+                    lid = i["update_id"] + 1
+                    msg = i.get("message", {}).get("text", "").lower()
+                    chat_id = i["message"]["chat"]["id"]
+                    
+                    if msg == "/pnl":
+                        wr = (total_wins/(total_wins+total_losses)*100) if (total_wins+total_losses)>0 else 0
+                        if config["ENABLE_1H"] and config["ENABLE_4H"]: st_mode = "DOUBLE (1H & 4H)"
+                        elif config["ENABLE_1H"]: st_mode = "HANYA 1H BIAS"
+                        elif config["ENABLE_4H"]: st_mode = "HANYA 4H BIAS"
+                        else: st_mode = "SEMUA MATI"
+                        
+                        resp = f"📊 PnL Bulan Ini ({current_month_str}): {round(total_pnl, 4)} USDT\nWinrate: {round(wr, 1)}%\nWins: {total_wins} | Loss: {total_losses}\nActive: {len(positions)}\n\n⚙️ Mode Aktif: {st_mode}"
+                        requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": resp})
+                        
+                    elif msg == "/mode 1h":
+                        config["ENABLE_1H"] = True; config["ENABLE_4H"] = False
+                        for e in engines: 
+                            if e.mode == "4H_BIAS": e.cancel_pending_limit(); e.reset()
+                        requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": "✅ Mode diubah: HANYA mencari setup 1H Bias."})
+                        
+                    elif msg == "/mode 4h":
+                        config["ENABLE_1H"] = False; config["ENABLE_4H"] = True
+                        for e in engines: 
+                            if e.mode == "1H_BIAS": e.cancel_pending_limit(); e.reset()
+                        requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": "✅ Mode diubah: HANYA mencari setup 4H Bias."})
+                        
+                    elif msg == "/mode double":
+                        config["ENABLE_1H"] = True; config["ENABLE_4H"] = True
+                        requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": "✅ Mode diubah: DOUBLE aktif (1H & 4H)."})
+        except: time.sleep(5)
+
 def on_user_msg(ws, m):
     global total_pnl, total_wins, total_losses, current_month_str
     d = json.loads(m)
     
-    # 1. DETEKSI LIMIT FILLED -> PASANG TP SAJA (SL sudah dipasang di awal)
     if d.get("e") == "ORDER_TRADE_UPDATE" and d["o"]["X"] == "FILLED" and d["o"]["ot"] == "LIMIT":
         s = d["o"]["s"]
         if s in active_signals:
             sig = active_signals[s]; pr = precisions[s]
             opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-            # Hanya perlu menembak TP. Karena posisi sudah ada (FILLED), closePosition="true" aman digunakan.
             post_api({"symbol":s,"side":opp,"type":"TAKE_PROFIT_MARKET","algoType":"CONDITIONAL","triggerPrice":round_v(sig["tp"],pr["tick"]),"closePosition":"true"}, "/fapi/v1/algoOrder")
             send_telegram(f"🚀 {s} LIMIT FILLED! Take Profit (TP) telah dipasang otomatis.")
 
-    # 2. DETEKSI POSISI CLOSED -> UPDATE PNL
     if d.get("e") == "ORDER_TRADE_UPDATE" and d["o"]["X"] == "FILLED" and float(d["o"].get("rp", 0)) != 0:
         rp = float(d["o"]["rp"]); s = d["o"]["s"]
         now_ym = datetime.now().strftime("%Y-%m")
@@ -288,6 +317,9 @@ def start():
             res = requests.get(f"{BASE_URL}/fapi/v1/klines", params={"symbol":s,"interval":tf,"limit":60}).json()
             klines_data[s][tf] = [{"t":k[0],"o":float(k[1]),"h":float(k[2]),"l":float(k[3]),"c":float(k[4]),"x":(i<len(res)-1)} for i,k in enumerate(res)]
     
+    # MEMANGGIL KEMBALI TELEGRAM COMMAND
+    threading.Thread(target=telegram_cmd, daemon=True).start()
+    
     streams = "/".join([f"{s.lower()}@kline_{tf}" for s in symbols for tf in ["1m","5m","15m","1h","4h"]])
     threading.Thread(target=lambda: websocket.WebSocketApp(f"{WS_BASE}/stream?streams={streams}", on_message=on_market_msg).run_forever(ping_interval=60)).start()
     
@@ -297,5 +329,5 @@ def start():
 
 engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 if __name__ == "__main__":
-    start(); print("🔥 BOT v4.10 (ULTIMATE PROTECTOR - REDUCE ONLY) ACTIVE...")
+    start(); print("🔥 BOT v4.11 (ULTIMATE + COMMANDS RESTORED) ACTIVE...")
     while True: time.sleep(1)
