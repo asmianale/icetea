@@ -159,7 +159,7 @@ class Engine:
                 self.cancel_pending_limit()
                 self.reset()
 
-    # --- FITUR BARU: PASANG LIMIT DAN SL BERSAMAAN ---
+    # --- FITUR BARU: LIMIT + SL BERSAMAAN DENGAN REDUCE ONLY ---
     def place_limit_and_sl_async(self):
         def run():
             try:
@@ -175,9 +175,17 @@ class Engine:
                 if "orderId" in res_limit:
                     self.pending_order_id = res_limit["orderId"]
                     
-                    # 2. LANGSUNG Pasang Stop Loss (Perlindungan Absolut)
-                    params_sl = {"symbol": self.symbol, "side": opp_side, "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": fsl, "closePosition": "true"}
-                    res_sl = post_api(params_sl, "/fapi/v1/algoOrder")
+                    # 2. LANGSUNG Pasang Stop Loss (Jalur Normal + Reduce Only + Quantity)
+                    # Tidak menggunakan closePosition agar tidak kena TIF GTE error!
+                    params_sl = {
+                        "symbol": self.symbol, 
+                        "side": opp_side, 
+                        "type": "STOP_MARKET", 
+                        "stopPrice": fsl, 
+                        "quantity": fq, 
+                        "reduceOnly": "true"
+                    }
+                    res_sl = post_api(params_sl, "/fapi/v1/order") 
                     
                     if "orderId" in res_sl:
                         self.pending_sl_id = res_sl["orderId"]
@@ -226,7 +234,7 @@ def on_user_msg(ws, m):
         if s in active_signals:
             sig = active_signals[s]; pr = precisions[s]
             opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-            # Hanya perlu menembak TP ke API AlgoOrder
+            # Hanya perlu menembak TP. Karena posisi sudah ada (FILLED), closePosition="true" aman digunakan.
             post_api({"symbol":s,"side":opp,"type":"TAKE_PROFIT_MARKET","algoType":"CONDITIONAL","triggerPrice":round_v(sig["tp"],pr["tick"]),"closePosition":"true"}, "/fapi/v1/algoOrder")
             send_telegram(f"🚀 {s} LIMIT FILLED! Take Profit (TP) telah dipasang otomatis.")
 
@@ -289,5 +297,5 @@ def start():
 
 engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 if __name__ == "__main__":
-    start(); print("🔥 BOT v4.9 (ULTIMATE PROTECTOR) ACTIVE...")
+    start(); print("🔥 BOT v4.10 (ULTIMATE PROTECTOR - REDUCE ONLY) ACTIVE...")
     while True: time.sleep(1)
