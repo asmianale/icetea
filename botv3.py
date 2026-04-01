@@ -539,9 +539,18 @@ def telegram_cmd():
                     if positions:
                         lines.append("📈 *Posisi Floating Aktif:*")
                         for sym, pos in positions.items():
-                            pnl = pos.get('up', 0)
+                            ep = pos.get('ep', 0)
+                            qty = pos.get('qty', 0)
+                            
+                            # Kalkulasi PnL MANDIRI (Super Akurat & Real-time)
+                            current_price = live_prices.get(sym, ep)
+                            if pos['side'] == "BUY":
+                                pnl = (current_price - ep) * qty
+                            else:
+                                pnl = (ep - current_price) * qty
+                                
                             emo = "🟩" if pnl > 0 else "🟥"
-                            lines.append(f"{emo} {sym} ({pos['side']}) | Entry: `{pos.get('ep', 0)}` | PnL: `{pnl:.2f} USDT`")
+                            lines.append(f"{emo} {sym} ({pos['side']}) | Entry: `{ep}` | PnL: `{pnl:.2f} USDT`")
                         lines.append("")
                     else:
                         lines.append("📈 *Posisi Floating:* Tidak ada\n")
@@ -598,6 +607,25 @@ def start_ws_with_reconnect(url, on_message, name="WS"):
 def start():
     load_precisions()
     load_monthly_pnl()
+    
+    # --- [OBAT AMNESIA] Tarik Posisi Floating dari Binance saat bot baru nyala ---
+    try:
+        pos_data = post_api({}, "/fapi/v2/positionRisk", method="GET")
+        if isinstance(pos_data, list):
+            for p in pos_data:
+                amt = float(p["positionAmt"])
+                sym = p["symbol"]
+                if amt != 0 and sym in symbols:
+                    positions[sym] = {
+                        "side": "BUY" if amt > 0 else "SELL",
+                        "qty": abs(amt),
+                        "ep": float(p["entryPrice"]),
+                        "up": float(p["unRealizedProfit"])
+                    }
+    except Exception as e:
+        logger.error(f"Gagal memuat riwayat posisi: {e}")
+    # ----------------------------------------------------------------------------
+
     for s in symbols:
         for tf in ["4h", "1h", "15m", "5m", "1m"]:
             try:
@@ -620,5 +648,5 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v5.6 (X-RAY + TELEGRAM FIXED) ACTIVE...")
+    print("🔥 BOT v5.7 (ANTI-AMNESIA + LIVE PNL FIXED) ACTIVE...")
     while True: time.sleep(1)
