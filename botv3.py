@@ -53,8 +53,12 @@ def send_telegram(msg):
         t, c = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
         if t and c:
             try:
-                requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
-                              json={"chat_id": c, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+                # Amankan teks dari error Markdown (ubah _ jadi spasi)
+                safe_msg = msg.replace("_", " ")
+                res = requests.post(f"https://api.telegram.org/bot{t}/sendMessage",
+                              json={"chat_id": c, "text": safe_msg, "parse_mode": "Markdown"}, timeout=10)
+                if not res.json().get("ok"):
+                    logger.error(f"Telegram Error: {res.text}")
             except Exception as e:
                 logger.warning(f"Telegram send gagal: {e}")
     threading.Thread(target=run, daemon=True).start()
@@ -188,34 +192,29 @@ class Engine:
         self.pending_order_id = None
         self.pending_sl_algo_id = None
         self.setup_time = None
-        self.last_processed_conf_t = 0 # Mencegah evaluasi ganda pada candle MTF yang sama
+        self.last_processed_conf_t = 0 
 
     def check_and_trigger(self, log_prefix, c_trig, c_conf):
         """
         X-RAY SCAN: Mengambil 35 candle LTF terakhir (30 untuk di-scan + 5 konteks BOS)
-        Memindai dari yang paling baru ke belakang mencari CISD + BOS.
         """
-        ltf_scan_range = c_trig[-36:-1] # Menggunakan candle LTF yang SUDAH CLOSED
+        ltf_scan_range = c_trig[-36:-1] 
         if len(ltf_scan_range) < 6: return False
         
-        # Scan mundur (dari candle terbaru ke yang paling lama dalam 30 menit terakhir)
         for i in range(len(ltf_scan_range) - 1, 4, -1):
             trigger_candle = ltf_scan_range[i]
             body = abs(trigger_candle["c"] - trigger_candle["o"])
             wick = trigger_candle["h"] - trigger_candle["l"]
             
-            # Deteksi Momentum CISD (> 60% Body)
             if wick > 0 and body / wick > 0.6:
                 recent_5 = ltf_scan_range[i-5:i]
                 recent_bodies_high = [max(x["o"], x["c"]) for x in recent_5]
                 recent_bodies_low = [min(x["o"], x["c"]) for x in recent_5]
                 
-                # Deteksi Valid BOS
                 if self.direction == "BUY" and trigger_candle["c"] > max(recent_bodies_high):
                     body_size = abs(trigger_candle["c"] - trigger_candle["o"])
-                    self.entry = trigger_candle["c"] - (body_size * 0.25) # 25% Pullback
+                    self.entry = trigger_candle["c"] - (body_size * 0.25) 
                     
-                    # SL di bawah swing 5 candle + buffer
                     recent_low = min(c["l"] for c in ltf_scan_range[i-5:i+1])
                     self.sl = recent_low - (recent_low * SL_BUFFER_PCT / 100)
                     
@@ -297,47 +296,38 @@ class Engine:
             _, zone_low, zone_high, _ = self.active_poi
             margin = (zone_high - zone_low) * 0.5
             
-            # Jika harga tembus terlalu jauh dari zona (Invalidate setup)
             if self.direction == "BUY" and price < zone_low - margin: self.reset(); return
             elif self.direction == "SELL" and price > zone_high + margin: self.reset(); return
 
-            prev_candle = c_conf[-2] # Mengambil candle MTF yang BARU SAJA DITUTUP
+            prev_candle = c_conf[-2] 
             
-            # Mencegah evaluasi ganda untuk candle MTF yang sama
             if prev_candle["t"] == self.last_processed_conf_t: return
             self.last_processed_conf_t = prev_candle["t"]
 
-            # --- TAHAP 1: C1 REJECTION ---
             if self.state == "WAIT_C1":
                 c1_valid = False
                 if self.direction == "BUY" and prev_candle["l"] <= zone_high and prev_candle["c"] > zone_high: c1_valid = True
                 elif self.direction == "SELL" and prev_candle["h"] >= zone_low and prev_candle["c"] < zone_low: c1_valid = True
 
                 if c1_valid:
-                    # Jika C1 sah, langsung Scan isi perutnya (30 candle LTF)!
                     if self.check_and_trigger("C1 Reject", c_trig, c_conf): return
                     
-                # Jika C1 tidak sah, atau sah tapi tidak ada CISD di 30 LTF terakhir -> Pindah ke C2
                 self.fc1 = prev_candle
                 self.state = "WAIT_C2"
                 return
 
-            # --- TAHAP 2: C2 SWEEP ---
             elif self.state == "WAIT_C2":
                 c2_valid = False
                 if self.direction == "BUY" and prev_candle["l"] < self.fc1["l"] and prev_candle["c"] > self.fc1["l"]: c2_valid = True
                 elif self.direction == "SELL" and prev_candle["h"] > self.fc1["h"] and prev_candle["c"] < self.fc1["h"]: c2_valid = True
 
                 if c2_valid:
-                    # Jika C2 nyapu C1, langsung Scan isi perutnya (30 candle LTF)!
                     if self.check_and_trigger("C2 Sweep", c_trig, c_conf): return
                 
-                # Pindah ke C3
                 self.fc2 = prev_candle
                 self.state = "WAIT_C3"
                 return
 
-            # --- TAHAP 3: C3 ENGULFING ---
             elif self.state == "WAIT_C3":
                 c3_valid = False
                 if self.direction == "BUY":
@@ -348,10 +338,8 @@ class Engine:
                     if prev_candle["c"] < fc2_body_low: c3_valid = True
 
                 if c3_valid:
-                    # Jika C3 engulf C2, Scan isi perutnya!
                     if self.check_and_trigger("C3 Engulfing", c_trig, c_conf): return
                 
-                # Jika sudah di tahap C3 dan gagal/tidak ada CISD -> Reset (Setup Basi)
                 self.reset()
                 return
 
@@ -359,7 +347,6 @@ class Engine:
         elif self.state == "WAIT_ENTRY":
             if self.entry is None or self.tp is None: self.reset(); return
 
-            # Batal jika harga melarikan diri menyentuh TP/SL duluan sebelum limit kita terjemput
             if (self.direction == "BUY" and (price >= self.tp or price <= self.sl)) or \
                (self.direction == "SELL" and (price <= self.tp or price >= self.sl)):
                 send_telegram(f"❌ {self.symbol} [{self.mode}] Batal: Harga sentuh TP/SL sebelum limit terisi.")
@@ -510,13 +497,25 @@ def telegram_cmd():
             if not r.get("ok"): time.sleep(5); continue
             for i in r["result"]:
                 lid = i["update_id"] + 1
-                msg = i.get("message", {}).get("text", "").strip().lower()
+                
+                text = i.get("message", {}).get("text", "")
+                if not text: continue
+                
+                msg = str(text).strip().lower()
                 chat_id = i.get("message", {}).get("chat", {}).get("id")
                 if not chat_id: continue
 
-                def reply(text): requests.post(f"https://api.telegram.org/bot{t}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=10)
+                def reply(reply_text):
+                    safe_text = reply_text.replace("_", " ") 
+                    res = requests.post(
+                        f"https://api.telegram.org/bot{t}/sendMessage", 
+                        json={"chat_id": chat_id, "text": safe_text, "parse_mode": "Markdown"}, 
+                        timeout=10
+                    )
+                    if not res.json().get("ok"): 
+                        logger.error(f"TG Error: {res.text}")
 
-                if msg == "/pnl":
+                if msg.startswith("/pnl"):
                     wr = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
                     mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
                     reply(f"📊 *PnL Bulan Ini* ({current_month_str})\n💰 Total: `{round(total_pnl, 4)} USDT`\n📈 Winrate: {round(wr, 1)}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n📌 Active: {len(positions)}\n⚙️ Mode: {mode_str}")
@@ -527,7 +526,7 @@ def telegram_cmd():
                     for e in engines: e.cancel_pending_orders(); e.reset()
                     reply(f"✅ Mode diubah ke: {msg.upper()}")
                 
-                elif msg == "/status":
+                elif msg.startswith("/status"):
                     lines = ["📊 *Bot Status Saat Ini*\n"]
                     
                     pending = [e for e in engines if e.state == "WAIT_ENTRY"]
@@ -553,14 +552,16 @@ def telegram_cmd():
                         for e in analyzing:
                             lines.append(f"• {e.symbol} [{e.mode}] ➔ {e.state}")
 
-                    if len(lines) == 4 and "Tidak ada" in lines[2] and not analyzing:
+                    if not pending and not positions and not analyzing:
                         lines = ["📊 *Bot Status Saat Ini*\n\n💤 Semua mata uang sedang IDLE (Mencari zona baru)."]
                         
                     reply("\n".join(lines))
                 
-                elif msg == "/help":
+                elif msg.startswith("/help"):
                     reply("*📖 Commands:*\n/pnl — Lihat PnL bulan ini\n/mode 1h — Hanya 1H bias\n/mode 4h — Hanya 4H bias\n/mode double — Kedua mode aktif\n/status — Status engine & posisi\n/help — Menu ini")
-        except: time.sleep(5)
+        except Exception as ex: 
+            logger.error(f"Telegram polling error: {ex}")
+            time.sleep(5)
 
 def keep_alive_listenkey():
     while True:
@@ -598,7 +599,6 @@ def start():
     load_precisions()
     load_monthly_pnl()
     for s in symbols:
-        # BUG FIXED: 1m ditambahkan ke riwayat untuk X-Ray Scan awal
         for tf in ["4h", "1h", "15m", "5m", "1m"]:
             try:
                 res = requests.get(f"{BASE_URL}/fapi/v1/klines", params={"symbol": s, "interval": tf, "limit": 80}, timeout=10).json()
@@ -620,5 +620,5 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v5.6 (X-RAY RETROSPECTIVE SNIPER) ACTIVE...")
+    print("🔥 BOT v5.6 (X-RAY + TELEGRAM FIXED) ACTIVE...")
     while True: time.sleep(1)
