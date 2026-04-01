@@ -121,10 +121,6 @@ def post_api(params, endpoint, method="POST"):
 # ==============================================================================
 
 def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
-    """
-    Deteksi FVG dan Order Block (OB) yang BELUM ter-mitigasi.
-    Returns: list of (direction, zone_bottom, zone_top, type)
-    """
     if len(candles) < depth + 3: return []
     pois = []
     start_idx = max(0, len(candles) - depth)
@@ -132,28 +128,21 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
     for i in range(start_idx, len(candles) - 2):
         c0, c1, c2 = candles[i], candles[i+1], candles[i+2]
 
-        # --- Bullish FVG ---
         if c0["h"] < c2["l"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 if not any(candles[j]["l"] <= c2["l"] for j in range(i+3, len(candles))):
                     pois.append(("BUY", c0["h"], c2["l"], "FVG"))
-
-        # --- Bearish FVG ---
         elif c0["l"] > c2["h"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 if not any(candles[j]["h"] >= c2["h"] for j in range(i+3, len(candles))):
                     pois.append(("SELL", c2["h"], c0["l"], "FVG"))
 
-        # --- Bullish Order Block ---
         if c0["c"] < c0["o"] and c1["c"] > c1["o"] and (c1["c"] - c1["o"]) > abs(c0["c"] - c0["o"]) * 1.5:
             if not any(candles[j]["l"] <= c0["h"] for j in range(i+2, len(candles))):
                 pois.append(("BUY", c0["l"], c0["h"], "OB"))
-
-        # --- Bearish Order Block ---
         elif c0["c"] > c0["o"] and c1["c"] < c1["o"] and (c1["o"] - c1["c"]) > abs(c0["c"] - c0["o"]) * 1.5:
             if not any(candles[j]["h"] >= c0["l"] for j in range(i+2, len(candles))):
                 pois.append(("SELL", c0["l"], c0["h"], "OB"))
-
     return pois
 
 def is_price_in_zone(price, poi_tuple):
@@ -172,7 +161,7 @@ def get_target(candles, direction, depth=20):
 
 
 # ==============================================================================
-# ENGINE CLASS
+# ENGINE CLASS (X-RAY RETROSPECTIVE SCAN)
 # ==============================================================================
 
 class Engine:
@@ -191,13 +180,78 @@ class Engine:
         self.state = "IDLE"
         self.direction = None
         self.active_poi = None 
+        self.fc1 = None
         self.fc2 = None
         self.entry = None
         self.sl = None
         self.tp = None
         self.pending_order_id = None
-        self.pending_sl_id = None
+        self.pending_sl_algo_id = None
         self.setup_time = None
+        self.last_processed_conf_t = 0 # Mencegah evaluasi ganda pada candle MTF yang sama
+
+    def check_and_trigger(self, log_prefix, c_trig, c_conf):
+        """
+        X-RAY SCAN: Mengambil 35 candle LTF terakhir (30 untuk di-scan + 5 konteks BOS)
+        Memindai dari yang paling baru ke belakang mencari CISD + BOS.
+        """
+        ltf_scan_range = c_trig[-36:-1] # Menggunakan candle LTF yang SUDAH CLOSED
+        if len(ltf_scan_range) < 6: return False
+        
+        # Scan mundur (dari candle terbaru ke yang paling lama dalam 30 menit terakhir)
+        for i in range(len(ltf_scan_range) - 1, 4, -1):
+            trigger_candle = ltf_scan_range[i]
+            body = abs(trigger_candle["c"] - trigger_candle["o"])
+            wick = trigger_candle["h"] - trigger_candle["l"]
+            
+            # Deteksi Momentum CISD (> 60% Body)
+            if wick > 0 and body / wick > 0.6:
+                recent_5 = ltf_scan_range[i-5:i]
+                recent_bodies_high = [max(x["o"], x["c"]) for x in recent_5]
+                recent_bodies_low = [min(x["o"], x["c"]) for x in recent_5]
+                
+                # Deteksi Valid BOS
+                if self.direction == "BUY" and trigger_candle["c"] > max(recent_bodies_high):
+                    body_size = abs(trigger_candle["c"] - trigger_candle["o"])
+                    self.entry = trigger_candle["c"] - (body_size * 0.25) # 25% Pullback
+                    
+                    # SL di bawah swing 5 candle + buffer
+                    recent_low = min(c["l"] for c in ltf_scan_range[i-5:i+1])
+                    self.sl = recent_low - (recent_low * SL_BUFFER_PCT / 100)
+                    
+                    self.tp = get_target(c_conf, self.direction)
+                    if not self.tp: return False
+                    
+                    risk = abs(self.entry - self.sl)
+                    reward = abs(self.tp - self.entry)
+                    if risk == 0 or reward / risk < MIN_RR: return False
+                    
+                    logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY CISD LTF Found! | Entry: {self.entry:.4f}")
+                    self.state = "WAIT_ENTRY"
+                    self.last_signal_time = time.time()
+                    self.place_limit_and_sl()
+                    return True
+                    
+                elif self.direction == "SELL" and trigger_candle["c"] < min(recent_bodies_low):
+                    body_size = abs(trigger_candle["c"] - trigger_candle["o"])
+                    self.entry = trigger_candle["c"] + (body_size * 0.25)
+                    
+                    recent_high = max(c["h"] for c in ltf_scan_range[i-5:i+1])
+                    self.sl = recent_high + (recent_high * SL_BUFFER_PCT / 100)
+                    
+                    self.tp = get_target(c_conf, self.direction)
+                    if not self.tp: return False
+                    
+                    risk = abs(self.entry - self.sl)
+                    reward = abs(self.tp - self.entry)
+                    if risk == 0 or reward / risk < MIN_RR: return False
+                    
+                    logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY CISD LTF Found! | Entry: {self.entry:.4f}")
+                    self.state = "WAIT_ENTRY"
+                    self.last_signal_time = time.time()
+                    self.place_limit_and_sl()
+                    return True
+        return False
 
     def tick(self):
         if (self.mode == "1H_BIAS" and not config["ENABLE_1H"]) or (self.mode == "4H_BIAS" and not config["ENABLE_4H"]):
@@ -217,7 +271,7 @@ class Engine:
         if time.time() - self.last_signal_time < self.cooldown_seconds and self.state == "IDLE": return
 
         if self.setup_time and time.time() - self.setup_time > 1800:
-            if self.state in ["WAIT_CONF", "WAIT_C3", "WAIT_TRIG"]:
+            if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]:
                 logger.info(f"{self.symbol} [{self.mode}] Setup timeout, reset")
                 self.reset()
                 return
@@ -231,134 +285,84 @@ class Engine:
                 if is_price_in_zone(price, poi):
                     self.direction = poi[0]
                     self.active_poi = poi
-                    self.state = "WAIT_CONF"
+                    self.state = "WAIT_C1"
                     self.setup_time = time.time()
-                    logger.info(f"{self.symbol} [{self.mode}] {poi[3]} ditemukan: {poi[0]} zona [{poi[1]:.4f} - {poi[2]:.4f}], harga: {price}")
                     return
 
-        # === STATE: WAIT_CONF / WAIT_C3 ===
-        elif self.state in ["WAIT_CONF", "WAIT_C3"]:
-            if not self.active_poi:
-                self.reset(); return
+        # === X-RAY STATE MACHINE (C1 -> C2 -> C3) ===
+        elif self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]:
+            if not self.active_poi: self.reset(); return
+            if len(c_conf) < 3: return
             
             _, zone_low, zone_high, _ = self.active_poi
             margin = (zone_high - zone_low) * 0.5
             
-            if self.direction == "BUY" and price < zone_low - margin:
-                self.reset(); return
-            elif self.direction == "SELL" and price > zone_high + margin:
-                self.reset(); return
+            # Jika harga tembus terlalu jauh dari zona (Invalidate setup)
+            if self.direction == "BUY" and price < zone_low - margin: self.reset(); return
+            elif self.direction == "SELL" and price > zone_high + margin: self.reset(); return
 
-            if len(c_conf) < 3: return
+            prev_candle = c_conf[-2] # Mengambil candle MTF yang BARU SAJA DITUTUP
+            
+            # Mencegah evaluasi ganda untuk candle MTF yang sama
+            if prev_candle["t"] == self.last_processed_conf_t: return
+            self.last_processed_conf_t = prev_candle["t"]
 
-            prev_candle = c_conf[-2]
-            prev2_candle = c_conf[-3]
+            # --- TAHAP 1: C1 REJECTION ---
+            if self.state == "WAIT_C1":
+                c1_valid = False
+                if self.direction == "BUY" and prev_candle["l"] <= zone_high and prev_candle["c"] > zone_high: c1_valid = True
+                elif self.direction == "SELL" and prev_candle["h"] >= zone_low and prev_candle["c"] < zone_low: c1_valid = True
 
-            if self.state == "WAIT_CONF":
-                # --- 1. JALUR CEPAT: C1 REJECTION ---
-                if self.direction == "BUY" and prev_candle["l"] <= zone_high and prev_candle["c"] > zone_high:
-                    self.state = "WAIT_TRIG"
-                    logger.info(f"{self.symbol} [{self.mode}] C1 Reject (Wick di zona, Close di atas)! Lanjut ke CISD LTF.")
-                    return
-                elif self.direction == "SELL" and prev_candle["h"] >= zone_low and prev_candle["c"] < zone_low:
-                    self.state = "WAIT_TRIG"
-                    logger.info(f"{self.symbol} [{self.mode}] C1 Reject (Wick di zona, Close di bawah)! Lanjut ke CISD LTF.")
-                    return
+                if c1_valid:
+                    # Jika C1 sah, langsung Scan isi perutnya (30 candle LTF)!
+                    if self.check_and_trigger("C1 Reject", c_trig, c_conf): return
+                    
+                # Jika C1 tidak sah, atau sah tapi tidak ada CISD di 30 LTF terakhir -> Pindah ke C2
+                self.fc1 = prev_candle
+                self.state = "WAIT_C2"
+                return
 
-                # --- 2. JALUR STANDAR: C2 SWEEP ---
-                if self.direction == "BUY":
-                    if prev_candle["l"] < prev2_candle["l"] and prev_candle["c"] > prev2_candle["l"]:
-                        self.state = "WAIT_TRIG"
-                        logger.info(f"{self.symbol} [{self.mode}] C2 Sweep & Reject! Lanjut ke CISD LTF.")
-                    elif prev_candle["l"] < prev2_candle["l"]:
-                        self.fc2 = prev_candle
-                        self.state = "WAIT_C3"
-                elif self.direction == "SELL":
-                    if prev_candle["h"] > prev2_candle["h"] and prev_candle["c"] < prev2_candle["h"]:
-                        self.state = "WAIT_TRIG"
-                        logger.info(f"{self.symbol} [{self.mode}] C2 Sweep & Reject! Lanjut ke CISD LTF.")
-                    elif prev_candle["h"] > prev2_candle["h"]:
-                        self.fc2 = prev_candle
-                        self.state = "WAIT_C3"
+            # --- TAHAP 2: C2 SWEEP ---
+            elif self.state == "WAIT_C2":
+                c2_valid = False
+                if self.direction == "BUY" and prev_candle["l"] < self.fc1["l"] and prev_candle["c"] > self.fc1["l"]: c2_valid = True
+                elif self.direction == "SELL" and prev_candle["h"] > self.fc1["h"] and prev_candle["c"] < self.fc1["h"]: c2_valid = True
 
+                if c2_valid:
+                    # Jika C2 nyapu C1, langsung Scan isi perutnya (30 candle LTF)!
+                    if self.check_and_trigger("C2 Sweep", c_trig, c_conf): return
+                
+                # Pindah ke C3
+                self.fc2 = prev_candle
+                self.state = "WAIT_C3"
+                return
+
+            # --- TAHAP 3: C3 ENGULFING ---
             elif self.state == "WAIT_C3":
-                # --- 3. JALUR FALLBACK: C3 ENGULFING ---
-                if self.fc2 and prev_candle["t"] > self.fc2["t"]:
-                    if self.direction == "BUY":
-                        fc2_body_high = max(self.fc2["o"], self.fc2["c"])
-                        if prev_candle["c"] > fc2_body_high:
-                            self.state = "WAIT_TRIG"
-                            logger.info(f"{self.symbol} [{self.mode}] C3 Engulfing Bullish! Lanjut ke CISD LTF.")
-                        else:
-                            self.state = "WAIT_CONF"
-                            self.fc2 = None
-                    elif self.direction == "SELL":
-                        fc2_body_low = min(self.fc2["o"], self.fc2["c"])
-                        if prev_candle["c"] < fc2_body_low:
-                            self.state = "WAIT_TRIG"
-                            logger.info(f"{self.symbol} [{self.mode}] C3 Engulfing Bearish! Lanjut ke CISD LTF.")
-                        else:
-                            self.state = "WAIT_CONF"
-                            self.fc2 = None
+                c3_valid = False
+                if self.direction == "BUY":
+                    fc2_body_high = max(self.fc2["o"], self.fc2["c"])
+                    if prev_candle["c"] > fc2_body_high: c3_valid = True
+                elif self.direction == "SELL":
+                    fc2_body_low = min(self.fc2["o"], self.fc2["c"])
+                    if prev_candle["c"] < fc2_body_low: c3_valid = True
 
-        # === STATE: WAIT_TRIG (CISD + BOS + 25% PULLBACK ENTRY) ===
-        elif self.state == "WAIT_TRIG":
-            if len(c_trig) < 6: return
-
-            trigger_candle = c_trig[-2]
-            body = abs(trigger_candle["c"] - trigger_candle["o"])
-            wick = trigger_candle["h"] - trigger_candle["l"]
-
-            # Syarat 1: Displacement (Momentum Dominan > 60%)
-            if wick > 0 and body / wick > 0.6:
-                recent_5 = c_trig[-6:-1]
-                recent_bodies_high = [max(x["o"], x["c"]) for x in recent_5[:-1]]
-                recent_bodies_low = [min(x["o"], x["c"]) for x in recent_5[:-1]]
-
-                triggered = False
-                # Syarat 2: Micro-BOS (Valid Body Break)
-                if self.direction == "BUY" and recent_bodies_high and trigger_candle["c"] > max(recent_bodies_high):
-                    triggered = True
-                elif self.direction == "SELL" and recent_bodies_low and trigger_candle["c"] < min(recent_bodies_low):
-                    triggered = True
-
-                if triggered:
-                    # Menghitung ukuran murni dari badan (body) candle pembawa CISD/BOS
-                    body_size = abs(trigger_candle["c"] - trigger_candle["o"])
-
-                    # ENTRY: Pullback 25% dari titik penutupan (Close)
-                    if self.direction == "BUY":
-                        self.entry = trigger_candle["c"] - (body_size * 0.25)
-                        recent_low = min(c["l"] for c in c_trig[-5:])
-                        self.sl = recent_low - (recent_low * SL_BUFFER_PCT / 100)
-                    else: # SELL
-                        self.entry = trigger_candle["c"] + (body_size * 0.25)
-                        recent_high = max(c["h"] for c in c_trig[-5:])
-                        self.sl = recent_high + (recent_high * SL_BUFFER_PCT / 100)
-
-                    self.tp = get_target(c_conf, self.direction)
-                    if self.tp is None: self.reset(); return
-
-                    if self.direction == "BUY" and (self.tp <= self.entry or self.sl >= self.entry): self.reset(); return
-                    if self.direction == "SELL" and (self.tp >= self.entry or self.sl <= self.entry): self.reset(); return
-
-                    risk = abs(self.entry - self.sl)
-                    reward = abs(self.tp - self.entry)
-                    if risk == 0 or reward / risk < MIN_RR: self.reset(); return
-
-                    logger.info(f"{self.symbol} [{self.mode}] CISD+BOS TRIGGERED! | Pullback Entry: {self.entry:.4f} SL: {self.sl:.4f} TP: {self.tp:.4f} RR: {reward/risk:.2f}")
-                    self.state = "WAIT_ENTRY"
-                    self.last_signal_time = time.time()
-                    self.place_limit_and_sl()
+                if c3_valid:
+                    # Jika C3 engulf C2, Scan isi perutnya!
+                    if self.check_and_trigger("C3 Engulfing", c_trig, c_conf): return
+                
+                # Jika sudah di tahap C3 dan gagal/tidak ada CISD -> Reset (Setup Basi)
+                self.reset()
+                return
 
         # === STATE: WAIT_ENTRY ===
         elif self.state == "WAIT_ENTRY":
-            if self.entry is None or self.tp is None:
-                self.reset(); return
+            if self.entry is None or self.tp is None: self.reset(); return
 
+            # Batal jika harga melarikan diri menyentuh TP/SL duluan sebelum limit kita terjemput
             if (self.direction == "BUY" and (price >= self.tp or price <= self.sl)) or \
                (self.direction == "SELL" and (price <= self.tp or price >= self.sl)):
-                send_telegram(f"❌ {self.symbol} [{self.mode}] Setup batal: Harga menyentuh target target/SL sebelum limit terisi.")
+                send_telegram(f"❌ {self.symbol} [{self.mode}] Batal: Harga sentuh TP/SL sebelum limit terisi.")
                 self.cancel_pending_orders()
                 self.reset()
 
@@ -371,8 +375,7 @@ class Engine:
                 qty_raw = (MARGIN_USDT * LEVERAGE) / self.entry
                 qty = float(round_v(qty_raw, pr["step"]))
 
-                if qty < pr["min_qty"] or (qty * self.entry) < pr["min_notional"]:
-                    self.reset(); return
+                if qty < pr["min_qty"] or (qty * self.entry) < pr["min_notional"]: self.reset(); return
 
                 fe = round_v(self.entry, pr["tick"])
                 fsl = round_v(self.sl, pr["tick"])
@@ -387,13 +390,21 @@ class Engine:
                 if "orderId" in res_limit:
                     self.pending_order_id = res_limit["orderId"]
                     
-                    # Protect account immediately with reduceOnly Stop Loss
-                    res_sl = post_api({"symbol": self.symbol, "side": opp_side, "type": "STOP_MARKET", "stopPrice": fsl, "quantity": fq, "reduceOnly": "true"}, "/fapi/v1/order")
+                    params_sl = {
+                        "algoType": "CONDITIONAL",
+                        "symbol": self.symbol, 
+                        "side": opp_side, 
+                        "type": "STOP_MARKET", 
+                        "triggerPrice": fsl, 
+                        "quantity": fq, 
+                        "reduceOnly": "true"
+                    }
+                    res_sl = post_api(params_sl, "/fapi/v1/algoOrder") 
                     
-                    if "orderId" in res_sl:
-                        self.pending_sl_id = res_sl["orderId"]
-                    else:
-                        send_telegram(f"⚠️ {self.symbol} Limit OK tapi SL gagal: {res_sl.get('msg', res_sl)}")
+                    if "algoId" in res_sl:
+                        self.pending_sl_algo_id = res_sl["algoId"]
+                    elif "orderId" in res_sl: 
+                        self.pending_sl_algo_id = res_sl["orderId"]
 
                     with state_lock:
                         active_signals[self.symbol] = {"mode": self.mode, "tp": self.tp, "dir": self.direction, "qty": fq}
@@ -411,12 +422,12 @@ class Engine:
             try:
                 if self.pending_order_id:
                     post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-                if self.pending_sl_id:
-                    post_api({"symbol": self.symbol, "orderId": self.pending_sl_id}, "/fapi/v1/order", method="DELETE")
+                if self.pending_sl_algo_id:
+                    post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
             except Exception as e: pass
         threading.Thread(target=run, daemon=True).start()
         self.pending_order_id = None
-        self.pending_sl_id = None
+        self.pending_sl_algo_id = None
 
 
 # ==============================================================================
@@ -443,14 +454,21 @@ def on_user_msg(ws, m):
         if d.get("e") == "ORDER_TRADE_UPDATE":
             o, s, stat = d["o"], d["o"]["s"], d["o"]["X"]
             
-            # Fire TP immediately when Limit fills
             if stat == "FILLED" and o.get("ot") == "LIMIT" and s in active_signals:
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-                post_api({"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}, "/fapi/v1/algoOrder")
+                
+                params_tp = {
+                    "algoType": "CONDITIONAL",
+                    "symbol": s, 
+                    "side": opp, 
+                    "type": "TAKE_PROFIT_MARKET", 
+                    "triggerPrice": round_v(sig["tp"], pr["tick"]), 
+                    "closePosition": "true"
+                }
+                post_api(params_tp, "/fapi/v1/algoOrder")
                 send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{round_v(sig['tp'], pr['tick'])}`")
 
-            # Track PnL
             if stat == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
                 now_ym = datetime.now().strftime("%Y-%m")
@@ -473,7 +491,12 @@ def on_user_msg(ws, m):
                         for e in engines:
                             if e.symbol == sym: e.reset()
                     else:
-                        positions[sym] = {"side": "BUY" if pa > 0 else "SELL", "qty": abs(pa)}
+                        positions[sym] = {
+                            "side": "BUY" if pa > 0 else "SELL", 
+                            "qty": abs(pa),
+                            "ep": float(p.get("ep", 0)), 
+                            "up": float(p.get("up", 0))  
+                        }
     except Exception as e: pass
 
 def telegram_cmd():
@@ -497,23 +520,44 @@ def telegram_cmd():
                     wr = (total_wins / (total_wins + total_losses) * 100) if (total_wins + total_losses) > 0 else 0
                     mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
                     reply(f"📊 *PnL Bulan Ini* ({current_month_str})\n💰 Total: `{round(total_pnl, 4)} USDT`\n📈 Winrate: {round(wr, 1)}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n📌 Active: {len(positions)}\n⚙️ Mode: {mode_str}")
+                
                 elif msg in ["/mode 1h", "/mode 4h", "/mode double"]:
                     config["ENABLE_1H"] = msg in ["/mode 1h", "/mode double"]
                     config["ENABLE_4H"] = msg in ["/mode 4h", "/mode double"]
                     for e in engines: e.cancel_pending_orders(); e.reset()
                     reply(f"✅ Mode diubah ke: {msg.upper()}")
+                
                 elif msg == "/status":
-                    lines = [f"📊 *Bot Status*\n"]
-                    for e in engines:
-                        if e.state != "IDLE":
-                            lines.append(f"• {e.symbol} [{e.mode}]: {e.state} ({e.direction})")
-                    if len(positions) > 0:
-                        lines.append(f"\n📌 *Posisi Aktif:*")
+                    lines = ["📊 *Bot Status Saat Ini*\n"]
+                    
+                    pending = [e for e in engines if e.state == "WAIT_ENTRY"]
+                    if pending:
+                        lines.append("⏳ *Limit Belum Kejemput:*")
+                        for e in pending:
+                            lines.append(f"• {e.symbol} ({e.direction}) | Entry: `{e.entry:.4f}`")
+                        lines.append("")
+                        
+                    if positions:
+                        lines.append("📈 *Posisi Floating Aktif:*")
                         for sym, pos in positions.items():
-                            lines.append(f"• {sym}: {pos['side']} qty={pos['qty']}")
-                    if len(lines) == 1:
-                        lines.append("Semua engine IDLE, tidak ada posisi aktif")
+                            pnl = pos.get('up', 0)
+                            emo = "🟩" if pnl > 0 else "🟥"
+                            lines.append(f"{emo} {sym} ({pos['side']}) | Entry: `{pos.get('ep', 0)}` | PnL: `{pnl:.2f} USDT`")
+                        lines.append("")
+                    else:
+                        lines.append("📈 *Posisi Floating:* Tidak ada\n")
+
+                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]]
+                    if analyzing:
+                        lines.append("🔍 *Sedang Analisa (Setup Ditemukan):*")
+                        for e in analyzing:
+                            lines.append(f"• {e.symbol} [{e.mode}] ➔ {e.state}")
+
+                    if len(lines) == 4 and "Tidak ada" in lines[2] and not analyzing:
+                        lines = ["📊 *Bot Status Saat Ini*\n\n💤 Semua mata uang sedang IDLE (Mencari zona baru)."]
+                        
                     reply("\n".join(lines))
+                
                 elif msg == "/help":
                     reply("*📖 Commands:*\n/pnl — Lihat PnL bulan ini\n/mode 1h — Hanya 1H bias\n/mode 4h — Hanya 4H bias\n/mode double — Kedua mode aktif\n/status — Status engine & posisi\n/help — Menu ini")
         except: time.sleep(5)
@@ -554,7 +598,8 @@ def start():
     load_precisions()
     load_monthly_pnl()
     for s in symbols:
-        for tf in ["4h", "1h", "15m", "5m"]:
+        # BUG FIXED: 1m ditambahkan ke riwayat untuk X-Ray Scan awal
+        for tf in ["4h", "1h", "15m", "5m", "1m"]:
             try:
                 res = requests.get(f"{BASE_URL}/fapi/v1/klines", params={"symbol": s, "interval": tf, "limit": 80}, timeout=10).json()
                 klines_data[s][tf] = [{"t": k[0], "o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "x": (i < len(res) - 1)} for i, k in enumerate(res)]
@@ -575,5 +620,5 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v5.3 (THE ULTIMATE PULLBACK SNIPER) ACTIVE...")
+    print("🔥 BOT v5.6 (X-RAY RETROSPECTIVE SNIPER) ACTIVE...")
     while True: time.sleep(1)
