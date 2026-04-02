@@ -515,6 +515,22 @@ def telegram_cmd():
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
                     if positions:
+                        # [PINTAR] Tarik data SL & TP langsung dari Binance Server (Paling Akurat)
+                        open_orders = post_api({}, "/fapi/v1/openOrders", method="GET")
+                        tp_map, sl_map = {}, {}
+                        
+                        if isinstance(open_orders, list):
+                            for o in open_orders:
+                                sym = o.get("symbol")
+                                o_type = o.get("type", "")
+                                # Untuk Stop Market & Take Profit Market, harga ada di "stopPrice"
+                                sp = float(o.get("stopPrice", 0))
+                                
+                                if o_type == "TAKE_PROFIT_MARKET" and sp > 0:
+                                    tp_map[sym] = sp
+                                elif o_type == "STOP_MARKET" and sp > 0:
+                                    sl_map[sym] = sp
+
                         for s, p in positions.items():
                             cur = live_prices.get(s, p['ep'])
                             pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
@@ -523,22 +539,20 @@ def telegram_cmd():
                             sign = "+" if pnl > 0 else ""
                             emo = "🟩" if pnl > 0 else "🟥"
 
-                            # Cari nilai TP dan SL dari memori Engine
-                            tp_val = "-"
-                            sl_val = "-"
                             pr = precisions.get(s, {})
                             tick = pr.get("tick", 4) if pr else 4
                             
-                            for e in engines:
-                                if e.symbol == s and e.tp:
-                                    tp_val = round_v(e.tp, tick)
-                                    sl_val = round_v(e.sl, tick)
-                                    break
+                            # Ambil dari map Binance Server, jika tidak ada, beri strip (-)
+                            tp_val = tp_map.get(s)
+                            sl_val = sl_map.get(s)
+                            
+                            tp_str = round_v(tp_val, tick) if tp_val else "-"
+                            sl_str = round_v(sl_val, tick) if sl_val else "-"
 
                             lines.append(f"{emo} *{s}* ({p['side']})")
                             lines.append(f"   Entry : `{p['ep']}`")
-                            lines.append(f"   TP    : `{tp_val}`")
-                            lines.append(f"   SL    : `{sl_val}`")
+                            lines.append(f"   TP    : `{tp_str}`")
+                            lines.append(f"   SL    : `{sl_str}`")
                             lines.append(f"   PnL   : `{sign}{pnl:.2f} USDT` (`{sign}{pnl_pct:.2f}%`)\n")
                     else:
                         lines.append("💤 Tidak ada posisi aktif.\n")
@@ -557,16 +571,18 @@ def telegram_cmd():
                             pr = precisions.get(e.symbol, {})
                             tick = pr.get("tick", 4) if pr else 4
                             
-                            tp_val = round_v(e.tp, tick) if e.tp else "-"
-                            sl_val = round_v(e.sl, tick) if e.sl else "-"
+                            # Jika statusnya WAIT_ENTRY (Limit tertunda), ambil TP SL dari Engine memory
+                            tp_str = round_v(e.tp, tick) if e.tp else "-"
+                            sl_str = round_v(e.sl, tick) if e.sl else "-"
 
                             lines.append(f"• *{e.symbol}* ({mode_clean})")
                             lines.append(f"  Bias  : `{state_clean}`")
-                            # Khusus status WAIT_ENTRY, tampilkan angka antrean Limit Entry-nya
+                            
                             if e.state == "WAIT_ENTRY" and e.entry:
                                 lines.append(f"  Entry : `{round_v(e.entry, tick)}`")
-                            lines.append(f"  TP    : `{tp_val}`")
-                            lines.append(f"  SL    : `{sl_val}`\n")
+                                
+                            lines.append(f"  TP    : `{tp_str}`")
+                            lines.append(f"  SL    : `{sl_str}`\n")
                     else:
                         lines.append("💤 Semua koin sedang IDLE.\n")
 
