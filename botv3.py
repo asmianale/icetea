@@ -508,16 +508,13 @@ def telegram_cmd():
 
                 # /status
                 elif txt.startswith("/status"):
-                    lines = ["📊 *Status Bot Saat Ini*"]
-                    
-                    pending = [e for e in engines if e.state == "WAIT_ENTRY"]
-                    if pending:
-                        lines.append("\n⏳ *Limit Belum Kejemput:*")
-                        for e in pending:
-                            lines.append(f"• {e.symbol} ({e.direction}) | Entry: `{e.entry:.4f}`")
-                        
+                    lines = ["📊 *STATUS BOT*\n"]
+
+                    lines.append("━━━━━━━━━━━━━━━━━━━")
+                    lines.append("📈 *POSISI FLOATING*")
+                    lines.append("━━━━━━━━━━━━━━━━━━━\n")
+
                     if positions:
-                        lines.append("\n📈 *Posisi Floating Aktif:*")
                         for s, p in positions.items():
                             cur = live_prices.get(s, p['ep'])
                             pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
@@ -525,20 +522,55 @@ def telegram_cmd():
                             pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
                             sign = "+" if pnl > 0 else ""
                             emo = "🟩" if pnl > 0 else "🟥"
-                            lines.append(f"{emo} {s} ({p['side']}) | Entry: `{p['ep']}` | PnL: `{pnl:.2f} USDT` | `{sign}{pnl_pct:.2f}%`")
+
+                            # Cari nilai TP dan SL dari memori Engine
+                            tp_val = "-"
+                            sl_val = "-"
+                            pr = precisions.get(s, {})
+                            tick = pr.get("tick", 4) if pr else 4
+                            
+                            for e in engines:
+                                if e.symbol == s and e.tp:
+                                    tp_val = round_v(e.tp, tick)
+                                    sl_val = round_v(e.sl, tick)
+                                    break
+
+                            lines.append(f"{emo} *{s}* ({p['side']})")
+                            lines.append(f"   Entry : `{p['ep']}`")
+                            lines.append(f"   TP    : `{tp_val}`")
+                            lines.append(f"   SL    : `{sl_val}`")
+                            lines.append(f"   PnL   : `{sign}{pnl:.2f} USDT` (`{sign}{pnl_pct:.2f}%`)\n")
                     else:
-                        lines.append("\n📈 *Posisi Floating:* Tidak ada")
+                        lines.append("💤 Tidak ada posisi aktif.\n")
 
-                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]]
+                    lines.append("━━━━━━━━━━━━━━━━━━━")
+                    lines.append("🔍 *ANALISA AKTIF*")
+                    lines.append("━━━━━━━━━━━━━━━━━━━\n")
+
+                    # Menggabungkan engine yang sedang WAIT konfirmasi dan WAIT_ENTRY
+                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY"]]
                     if analyzing:
-                        lines.append("\n🔍 *Sedang Analisa (Setup Ditemukan):*")
                         for e in analyzing:
-                            lines.append(f"• {e.symbol} [{e.mode}] ➔ {e.state}")
+                            mode_clean = "1H" if "1H" in e.mode else "4H"
+                            state_clean = e.state.replace('_', ' ')
+                            
+                            pr = precisions.get(e.symbol, {})
+                            tick = pr.get("tick", 4) if pr else 4
+                            
+                            tp_val = round_v(e.tp, tick) if e.tp else "-"
+                            sl_val = round_v(e.sl, tick) if e.sl else "-"
 
-                    if not pending and not positions and not analyzing:
-                        lines = ["📊 *Status Bot Saat Ini*\n\n💤 Semua koin sedang IDLE (Mencari zona)."]
-                        
-                    rep("\n".join(lines))
+                            lines.append(f"• *{e.symbol}* ({mode_clean})")
+                            lines.append(f"  Bias  : `{state_clean}`")
+                            # Khusus status WAIT_ENTRY, tampilkan angka antrean Limit Entry-nya
+                            if e.state == "WAIT_ENTRY" and e.entry:
+                                lines.append(f"  Entry : `{round_v(e.entry, tick)}`")
+                            lines.append(f"  TP    : `{tp_val}`")
+                            lines.append(f"  SL    : `{sl_val}`\n")
+                    else:
+                        lines.append("💤 Semua koin sedang IDLE.\n")
+
+                    rep("\n".join(lines).strip())
 
                 # /close
                 elif txt.startswith("/close"):
