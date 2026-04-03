@@ -122,16 +122,16 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — DUAL ZONE (ANTI-ZOMBIE & FRESH FVG ONLY)
+# LOGIKA SMC — STRICT VIRGIN FVG (ZERO TOUCH DENGAN PERLINDUNGAN LIVE CANDLE)
 # ==============================================================================
-def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
+def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1): 
     if len(candles) < depth + 4: return []
     pois = []
     start_idx = max(0, len(candles) - depth)
 
     for i in range(start_idx, len(candles) - 3):
         c0 = candles[i]
-        c1 = candles[i+1] # Candle Penembus
+        c1 = candles[i+1] # Candle Momentum
         c2 = candles[i+2]
 
         # 🟢 BULLISH FVG
@@ -141,9 +141,10 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
                 ob_b, ob_t = c0["l"], c0["h"] 
                 
                 is_valid = True
-                for j in range(i+3, len(candles)):
-                    # Mitigated FVG / Tembus OB = Gagal
-                    if candles[j]["l"] <= fvg_b or candles[j]["l"] < ob_b: 
+                # Abaikan live candle terakhir (-1) agar tidak batal saat di-tap hari ini
+                for j in range(i+3, len(candles) - 1):
+                    # Batal jika harga menembus atap FVG walau 1 tick di masa lalu
+                    if candles[j]["l"] <= fvg_t: 
                         is_valid = False; break 
                         
                 if is_valid: 
@@ -156,9 +157,10 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
                 ob_b, ob_t = c0["l"], c0["h"] 
                 
                 is_valid = True
-                for j in range(i+3, len(candles)):
-                    # Mitigated FVG / Tembus OB = Gagal
-                    if candles[j]["h"] >= fvg_t or candles[j]["h"] > ob_t: 
+                # Abaikan live candle terakhir (-1) agar tidak batal saat di-tap hari ini
+                for j in range(i+3, len(candles) - 1):
+                    # Batal jika harga menembus lantai FVG walau 1 tick di masa lalu
+                    if candles[j]["h"] >= fvg_b: 
                         is_valid = False; break 
                         
                 if is_valid: 
@@ -792,6 +794,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v7.5 (THE MASTERPIECE) ACTIVE...")
+    print("🔥 BOT v7.7 (THE VIRGIN SNIPER) ACTIVE...")
     while True:
         time.sleep(1)
