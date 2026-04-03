@@ -379,13 +379,14 @@ class Engine:
                     self.pending_order_id = res["orderId"]
                     opp = "SELL" if self.direction == "BUY" else "BUY"
                     
-                    sl_params = {"symbol": self.symbol, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"}
-                    sl_res = post_api(sl_params, "/fapi/v1/order")
+                    # --- [FIX MUTLAK]: Menggunakan endpoint algoOrder dan closePosition="true" ---
+                    sl_params = {"symbol": self.symbol, "side": opp, "algoType": "CONDITIONAL", "type": "STOP_MARKET", "triggerPrice": round_v(self.sl, p["tick"]), "closePosition": "true"}
+                    sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
                     if "code" in sl_res:
                         send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
                     else:
-                        self.pending_sl_algo_id = sl_res.get("orderId")
+                        self.pending_sl_algo_id = sl_res.get("algoId") # Algo endpoint mengembalikan algoId
                     
                     ep_str = round_v(self.entry, p["tick"])
                     sl_str = round_v(self.sl, p["tick"])
@@ -404,7 +405,8 @@ class Engine:
     def cancel_pending_orders(self):
         def run():
             if self.pending_order_id: post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-            if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "orderId": self.pending_sl_algo_id}, "/fapi/v1/order", method="DELETE")
+            # --- [FIX MUTLAK]: Menghapus SL di endpoint algoOrder ---
+            if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
@@ -462,11 +464,21 @@ def telegram_cmd():
                             tick = pr.get("tick", 4) if pr else 4
                             tp_val, sl_val = None, None
                             
+                            # Cek laci standar
                             orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
                             if isinstance(orders, list):
                                 for o in orders:
                                     o_type = o.get("type", "")
                                     sp = float(o.get("stopPrice", 0))
+                                    if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
+                                    elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
+
+                            # --- [FIX MUTLAK]: Cek laci Algo untuk mencari SL/TP ---
+                            algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
+                            if isinstance(algo_orders, list):
+                                for o in algo_orders:
+                                    o_type = o.get("type", o.get("orderType", ""))
+                                    sp = float(o.get("triggerPrice", o.get("stopPrice", 0)))
                                     if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
                                     elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
@@ -544,6 +556,8 @@ def telegram_cmd():
                         side = "SELL" if p["side"] == "BUY" else "BUY"
                         post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
+                        # --- [FIX MUTLAK]: Bersihkan juga laci Algo ---
+                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         rep(f"🛑 {s} ditutup paksa via Market.")
 
                 elif txt.startswith("/bep"):
@@ -552,15 +566,17 @@ def telegram_cmd():
                     to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
                     for s in to_bep:
                         p, pr = positions[s], precisions.get(s)
-                        orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
-                        if isinstance(orders, list):
-                            for order in orders:
-                                if order.get("type", "") in ["STOP_MARKET", "STOP"]:
-                                    post_api({"symbol": s, "orderId": order.get("orderId")}, "/fapi/v1/order", method="DELETE")
+                        
+                        # --- [FIX MUTLAK]: Cari dan hapus SL lama di laci Algo ---
+                        algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
+                        if isinstance(algo_orders, list):
+                            for order in algo_orders:
+                                if order.get("type", order.get("orderType", "")) in ["STOP_MARKET", "STOP"]:
+                                    post_api({"symbol": s, "algoId": order.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
                         
                         opp = "SELL" if p["side"] == "BUY" else "BUY"
-                        qty_str = round_v(p["qty"], pr["step"])
-                        post_api({"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
+                        # --- [FIX MUTLAK]: Pasang SL BEP via laci Algo dengan closePosition ---
+                        post_api({"symbol": s, "side": opp, "algoType": "CONDITIONAL", "type": "STOP_MARKET", "triggerPrice": round_v(p["ep"], pr["tick"]), "closePosition": "true"}, "/fapi/v1/algoOrder")
                         rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
                 elif txt.startswith("/help"):
@@ -626,8 +642,10 @@ def on_user_msg(ws, m):
             if o["X"] == "FILLED" and o.get("o") == "LIMIT" and s in active_signals:
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-                params = {"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
-                res = post_api(params, "/fapi/v1/order")
+                
+                # --- [FIX MUTLAK]: Pasang TP otomatis via laci Algo dengan closePosition ---
+                params = {"symbol": s, "side": opp, "algoType": "CONDITIONAL", "type": "TAKE_PROFIT_MARKET", "triggerPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
+                res = post_api(params, "/fapi/v1/algoOrder")
                 
                 if "code" in res:
                     send_telegram(f"⚠️ ERROR BINANCE (TP {s}): {res.get('msg')}")
@@ -658,6 +676,8 @@ def on_user_msg(ws, m):
                     if pa == 0:
                         positions.pop(s, None); active_signals.pop(s, None)
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
+                        # --- [FIX MUTLAK]: Bersihkan sisa jaring di laci Algo saat posisi ditutup ---
+                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         for e in engines:
                             if e.symbol == s: e.reset()
                     else:
@@ -722,6 +742,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v6.9 (THE FINAL POLISH) ACTIVE...")
+    print("🔥 BOT v7.0 (THE ALGO MASTER) ACTIVE...")
     while True:
         time.sleep(1)
