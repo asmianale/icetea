@@ -172,6 +172,7 @@ class Engine:
     def __init__(self, symbol, mode):
         self.symbol = symbol
         self.mode = mode
+        self.ignored_pois = [] # --- [FIX 1]: List Blacklist POI Zombie ---
         self.reset()
         if mode == "1H_BIAS": self.tf_poi, self.tf_conf, self.tf_trig = "1h", "15m", "1m"
         else: self.tf_poi, self.tf_conf, self.tf_trig = "4h", "1h", "5m"
@@ -208,19 +209,16 @@ class Engine:
                 highs = [max(x["o"], x["c"]) for x in prev_5]
                 lows = [min(x["o"], x["c"]) for x in prev_5]
                 
-                # --- MATEMATIKA BUY FIX ---
                 if self.direction == "BUY" and curr["c"] > max(highs):
                     cisd_low = min(c["l"] for c in ltf_scan[i-5:i+1])
                     if cisd_low > poi["fvg_t"] or cisd_low < poi["ob_b"]: continue
                         
                     self.entry = curr["c"] - (body * 0.25)
                     self.sl = cisd_low - (cisd_low * SL_BUFFER_PCT / 100)
-                    
                     if self.sl >= self.entry: continue 
                     
                     self.tp = get_target(c_conf, self.direction)
-                    if not self.tp or self.tp <= self.entry:
-                        self.tp = self.entry + ((self.entry - self.sl) * 2.0)
+                    if not self.tp or self.tp <= self.entry: self.tp = self.entry + ((self.entry - self.sl) * 2.0)
                     
                     risk = self.entry - self.sl
                     reward = self.tp - self.entry
@@ -231,19 +229,16 @@ class Engine:
                         self.place_limit_and_sl()
                         return True
                         
-                # --- MATEMATIKA SELL FIX ---
                 elif self.direction == "SELL" and curr["c"] < min(lows):
                     cisd_high = max(c["h"] for c in ltf_scan[i-5:i+1])
                     if cisd_high < poi["fvg_b"] or cisd_high > poi["ob_t"]: continue
                         
                     self.entry = curr["c"] + (body * 0.25)
                     self.sl = cisd_high + (cisd_high * SL_BUFFER_PCT / 100)
-                    
                     if self.sl <= self.entry: continue
                     
                     self.tp = get_target(c_conf, self.direction)
-                    if not self.tp or self.tp >= self.entry:
-                        self.tp = self.entry - ((self.sl - self.entry) * 2.0)
+                    if not self.tp or self.tp >= self.entry: self.tp = self.entry - ((self.sl - self.entry) * 2.0)
                     
                     risk = self.sl - self.entry
                     reward = self.entry - self.tp
@@ -273,11 +268,15 @@ class Engine:
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
         if self.setup_time and time.time() - self.setup_time > 3600:
-            if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]: self.reset(); return
+            if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
+                if self.active_poi: self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika expired
+                self.reset(); return
 
         if self.state == "IDLE":
             pois = get_unmitigated_poi(c_p)
             for poi in reversed(pois):
+                if poi["t"] in self.ignored_pois: continue # --- [FIX 1]: Abaikan POI yang sudah diblacklist
+                
                 in_fvg = poi["fvg_b"] <= price <= poi["fvg_t"]
                 in_ob = poi["ob_b"] <= price <= poi["ob_t"]
                 
@@ -347,7 +346,9 @@ class Engine:
                 if self.active_zone == "FVG":
                     self.state = "WAIT_OB_TOUCH"
                     self.fc1 = None; self.fc2 = None
-                else: self.reset() 
+                else: 
+                    self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika OB juga gagal total
+                    self.reset() 
                 
         elif self.state == "WAIT_ENTRY":
             hit_tp_sl_buy = self.direction == "BUY" and (price >= self.tp or price <= self.sl)
@@ -356,6 +357,7 @@ class Engine:
             if hit_tp_sl_buy or hit_tp_sl_sell:
                 send_telegram(f"❌ {self.symbol} [{self.mode}] Batal: Harga lari ke TP/SL duluan.")
                 self.cancel_pending_orders()
+                self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika batal ditinggal lari
                 self.reset()
 
     def place_limit_and_sl(self):
@@ -379,19 +381,18 @@ class Engine:
                     self.pending_order_id = res["orderId"]
                     opp = "SELL" if self.direction == "BUY" else "BUY"
                     
-                    # --- [FIX MUTLAK]: Menggunakan endpoint algoOrder dan closePosition="true" ---
-                    sl_params = {"symbol": self.symbol, "side": opp, "algoType": "CONDITIONAL", "type": "STOP_MARKET", "triggerPrice": round_v(self.sl, p["tick"]), "closePosition": "true"}
+                    sl_params = {
+                        "symbol": self.symbol, "side": opp, "type": "STOP_MARKET", 
+                        "stopPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"
+                    }
                     sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
-                    if "code" in sl_res:
-                        send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
-                    else:
-                        self.pending_sl_algo_id = sl_res.get("algoId") # Algo endpoint mengembalikan algoId
+                    if "code" in sl_res: send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
+                    else: self.pending_sl_algo_id = sl_res.get("algoId") or sl_res.get("orderId")
                     
                     ep_str = round_v(self.entry, p["tick"])
                     sl_str = round_v(self.sl, p["tick"])
                     tp_str = round_v(self.tp, p["tick"])
-                    
                     msg = f"⏳ *{self.symbol}* LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: `{ep_str}`\n🛑 SL: `{sl_str}`\n🎯 TP: `{tp_str}`"
                     send_telegram(msg)
                 else: 
@@ -405,7 +406,6 @@ class Engine:
     def cancel_pending_orders(self):
         def run():
             if self.pending_order_id: post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-            # --- [FIX MUTLAK]: Menghapus SL di endpoint algoOrder ---
             if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
         threading.Thread(target=run, daemon=True).start()
 
@@ -464,7 +464,6 @@ def telegram_cmd():
                             tick = pr.get("tick", 4) if pr else 4
                             tp_val, sl_val = None, None
                             
-                            # Cek laci standar
                             orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
                             if isinstance(orders, list):
                                 for o in orders:
@@ -473,12 +472,11 @@ def telegram_cmd():
                                     if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
                                     elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
-                            # --- [FIX MUTLAK]: Cek laci Algo untuk mencari SL/TP ---
                             algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
                             if isinstance(algo_orders, list):
                                 for o in algo_orders:
                                     o_type = o.get("type", o.get("orderType", ""))
-                                    sp = float(o.get("triggerPrice", o.get("stopPrice", 0)))
+                                    sp = float(o.get("stopPrice", 0))
                                     if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
                                     elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
@@ -556,7 +554,6 @@ def telegram_cmd():
                         side = "SELL" if p["side"] == "BUY" else "BUY"
                         post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
-                        # --- [FIX MUTLAK]: Bersihkan juga laci Algo ---
                         post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         rep(f"🛑 {s} ditutup paksa via Market.")
 
@@ -567,7 +564,6 @@ def telegram_cmd():
                     for s in to_bep:
                         p, pr = positions[s], precisions.get(s)
                         
-                        # --- [FIX MUTLAK]: Cari dan hapus SL lama di laci Algo ---
                         algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
                         if isinstance(algo_orders, list):
                             for order in algo_orders:
@@ -575,8 +571,12 @@ def telegram_cmd():
                                     post_api({"symbol": s, "algoId": order.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
                         
                         opp = "SELL" if p["side"] == "BUY" else "BUY"
-                        # --- [FIX MUTLAK]: Pasang SL BEP via laci Algo dengan closePosition ---
-                        post_api({"symbol": s, "side": opp, "algoType": "CONDITIONAL", "type": "STOP_MARKET", "triggerPrice": round_v(p["ep"], pr["tick"]), "closePosition": "true"}, "/fapi/v1/algoOrder")
+                        qty_str = round_v(p["qty"], pr["step"])
+                        
+                        post_api({
+                            "symbol": s, "side": opp, "type": "STOP_MARKET", 
+                            "stopPrice": round_v(p["ep"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"
+                        }, "/fapi/v1/algoOrder")
                         rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
                 elif txt.startswith("/help"):
@@ -642,16 +642,16 @@ def on_user_msg(ws, m):
             if o["X"] == "FILLED" and o.get("o") == "LIMIT" and s in active_signals:
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
+                qty_str = round_v(sig["qty"], pr["step"])
                 
-                # --- [FIX MUTLAK]: Pasang TP otomatis via laci Algo dengan closePosition ---
-                params = {"symbol": s, "side": opp, "algoType": "CONDITIONAL", "type": "TAKE_PROFIT_MARKET", "triggerPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
+                params = {
+                    "symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", 
+                    "stopPrice": round_v(sig["tp"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"
+                }
                 res = post_api(params, "/fapi/v1/algoOrder")
                 
-                if "code" in res:
-                    send_telegram(f"⚠️ ERROR BINANCE (TP {s}): {res.get('msg')}")
-                else:
-                    tp_str = round_v(sig['tp'], pr['tick'])
-                    send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{tp_str}`")
+                if "code" in res: send_telegram(f"⚠️ ERROR BINANCE (TP {s}): {res.get('msg')}")
+                else: send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{round_v(sig['tp'], pr['tick'])}`")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
@@ -676,12 +676,16 @@ def on_user_msg(ws, m):
                     if pa == 0:
                         positions.pop(s, None); active_signals.pop(s, None)
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
-                        # --- [FIX MUTLAK]: Bersihkan sisa jaring di laci Algo saat posisi ditutup ---
                         post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         for e in engines:
                             if e.symbol == s: e.reset()
                     else:
                         positions[s] = {"side": "BUY" if pa > 0 else "SELL", "qty": abs(pa), "ep": float(p["ep"])}
+                        for e in engines:
+                            if e.symbol == s:
+                                # --- [FIX 2]: Hapus Hantu Analisa saat posisi terbentuk & Blacklist POI yang dipakai ---
+                                if e.active_poi: e.ignored_pois.append(e.active_poi["t"])
+                                e.reset()
     except Exception as e:
         pass
 
@@ -742,6 +746,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v7.0 (THE ALGO MASTER) ACTIVE...")
+    print("🔥 BOT v7.2 (THE LOGIC SWEEPER) ACTIVE...")
     while True:
         time.sleep(1)
