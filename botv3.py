@@ -131,7 +131,7 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — FVG DINAMIS
+# LOGIKA SMC — DUAL ZONE (OB + FVG KESATUAN)
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
     if len(candles) < depth + 4: return []
@@ -143,26 +143,37 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
         c1 = candles[i+1]
         c2 = candles[i+2]
 
+        # 🟢 BULLISH FVG + OB
         if c0["h"] < c2["l"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
-                gap_bottom, gap_top, is_valid = c0["h"], c2["l"], True
+                fvg_b, fvg_t = c0["h"], c2["l"]
+                ob_b, ob_t = c0["l"], c0["h"] # OB ada tepat di bawah FVG
+                is_valid = True
+                
                 for j in range(i+3, len(candles)):
-                    if candles[j]["l"] < gap_top: gap_top = candles[j]["l"] 
-                    if gap_top <= gap_bottom: is_valid = False; break 
-                if is_valid: pois.append(("BUY", gap_bottom, gap_top, "FVG"))
+                    # Jika harga menembus lantai OB, setup hangus total
+                    if candles[j]["l"] < ob_b: 
+                        is_valid = False; break 
+                        
+                if is_valid: 
+                    pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
+        # 🔴 BEARISH FVG + OB
         elif c0["l"] > c2["h"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
-                gap_top, gap_bottom, is_valid = c0["l"], c2["h"], True
+                fvg_t, fvg_b = c0["l"], c2["h"]
+                ob_b, ob_t = c0["l"], c0["h"] # OB ada tepat di atas FVG
+                is_valid = True
+                
                 for j in range(i+3, len(candles)):
-                    if candles[j]["h"] > gap_bottom: gap_bottom = candles[j]["h"] 
-                    if gap_bottom >= gap_top: is_valid = False; break 
-                if is_valid: pois.append(("SELL", gap_bottom, gap_top, "FVG"))
+                    # Jika harga menembus atap OB, setup hangus total
+                    if candles[j]["h"] > ob_t: 
+                        is_valid = False; break 
+                        
+                if is_valid: 
+                    pois.append({"dir": "SELL", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
     return pois
-
-def is_price_in_zone(price, poi):
-    return poi[1] <= price <= poi[2]
 
 def get_target(candles, direction, depth=20):
     recent = candles[-depth:]
@@ -193,6 +204,7 @@ class Engine:
         self.state = "IDLE"
         self.direction = None
         self.active_poi = None
+        self.active_zone = None
         self.fc1 = None
         self.fc2 = None
         self.entry = None
@@ -206,6 +218,7 @@ class Engine:
     def check_and_trigger(self, log_prefix, c_trig, c_conf, scan_depth):
         ltf_scan = c_trig[-scan_depth:] 
         if len(ltf_scan) < 6: return False
+        poi = self.active_poi
             
         for i in range(len(ltf_scan)-1, 4, -1):
             curr = ltf_scan[i]
@@ -219,12 +232,18 @@ class Engine:
                 
                 # BUY SETUP
                 if self.direction == "BUY" and curr["c"] > max(highs):
+                    # TERSANGKA 1 FIX: KTP Check Akar CISD
+                    cisd_low = min(c["l"] for c in ltf_scan[i-5:i+1])
+                    if cisd_low > poi["fvg_t"] or cisd_low < poi["ob_b"]:
+                        continue # Batal, CISD melayang di luar zona Ibu-Anak (OB-FVG)
+                        
                     self.entry = curr["c"] - (body * 0.25)
-                    sl_low = min(c["l"] for c in ltf_scan[i-5:i+1])
+                    sl_low = cisd_low
                     self.sl = sl_low - (sl_low * SL_BUFFER_PCT / 100)
                     self.tp = get_target(c_conf, self.direction)
+                    
                     if self.tp and abs(self.tp - self.entry) / abs(self.entry - self.sl) >= MIN_RR:
-                        logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY (Depth {scan_depth}) Found!")
+                        logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY Found!")
                         self.state = "WAIT_ENTRY"
                         self.last_signal_time = time.time()
                         self.place_limit_and_sl()
@@ -232,12 +251,18 @@ class Engine:
                         
                 # SELL SETUP
                 elif self.direction == "SELL" and curr["c"] < min(lows):
+                    # TERSANGKA 1 FIX: KTP Check Akar CISD
+                    cisd_high = max(c["h"] for c in ltf_scan[i-5:i+1])
+                    if cisd_high < poi["fvg_b"] or cisd_high > poi["ob_t"]:
+                        continue # Batal, CISD melayang di luar zona Ibu-Anak (OB-FVG)
+                        
                     self.entry = curr["c"] + (body * 0.25)
-                    sl_high = max(c["h"] for c in ltf_scan[i-5:i+1])
+                    sl_high = cisd_high
                     self.sl = sl_high + (sl_high * SL_BUFFER_PCT / 100)
                     self.tp = get_target(c_conf, self.direction)
+                    
                     if self.tp and abs(self.entry - self.tp) / abs(self.sl - self.entry) >= MIN_RR:
-                        logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY (Depth {scan_depth}) Found!")
+                        logger.info(f"{self.symbol} [{self.mode}] {log_prefix} -> X-RAY Found!")
                         self.state = "WAIT_ENTRY"
                         self.last_signal_time = time.time()
                         self.place_limit_and_sl()
@@ -261,47 +286,77 @@ class Engine:
         if not c_p or price == 0: return
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
-        if self.setup_time and time.time() - self.setup_time > 3600: # Diperpanjang ke 1 Jam untuk durasi C1-C3
-            if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]:
+        if self.setup_time and time.time() - self.setup_time > 3600:
+            if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
                 self.reset()
                 return
 
+        # STATE: IDLE (Mencari Zona)
         if self.state == "IDLE":
             pois = get_unmitigated_poi(c_p)
             for poi in reversed(pois):
-                if is_price_in_zone(price, poi):
-                    self.direction = poi[0]
+                in_fvg = poi["fvg_b"] <= price <= poi["fvg_t"]
+                in_ob = poi["ob_b"] <= price <= poi["ob_t"]
+                
+                if in_fvg or in_ob:
+                    self.direction = poi["dir"]
                     self.active_poi = poi
+                    self.active_zone = "FVG" if in_fvg else "OB"
                     self.state = "WAIT_C1"
                     self.setup_time = time.time()
                     return
                     
+        # STATE: WAIT_OB_TOUCH (FVG Gagal, Tunggu Sentuh OB)
+        elif self.state == "WAIT_OB_TOUCH":
+            poi = self.active_poi
+            if self.direction == "BUY":
+                if price < poi["ob_b"]: self.reset(); return # Tembus OB, Batal!
+                if price <= poi["ob_t"]: # Menyentuh ujung OB
+                    self.active_zone = "OB"
+                    self.state = "WAIT_C1"
+                    self.setup_time = time.time()
+            elif self.direction == "SELL":
+                if price > poi["ob_t"]: self.reset(); return # Tembus OB, Batal!
+                if price >= poi["ob_b"]: # Menyentuh ujung OB
+                    self.active_zone = "OB"
+                    self.state = "WAIT_C1"
+                    self.setup_time = time.time()
+
+        # STATE: C1, C2, C3
         elif self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]:
-            if not self.active_poi:
-                self.reset()
-                return
-                
-            margin = (self.active_poi[2] - self.active_poi[1]) * 0.5
-            if self.direction == "BUY" and price < self.active_poi[1] - margin:
-                self.reset()
-                return
-            elif self.direction == "SELL" and price > self.active_poi[2] + margin:
-                self.reset()
-                return
+            poi = self.active_poi
+            
+            # Cek Pelanggaran Zona Dinamis
+            if self.direction == "BUY":
+                if price < poi["ob_b"]: self.reset(); return 
+                # Jatuh dari FVG langsung ke OB di tengah proses? Pindah fase!
+                if self.active_zone == "FVG" and price < poi["fvg_b"]:
+                    self.active_zone = "OB"
+                    self.state = "WAIT_C1"
+                    self.setup_time = time.time()
+                    self.fc1 = None; self.fc2 = None
+                    return
+            elif self.direction == "SELL":
+                if price > poi["ob_t"]: self.reset(); return 
+                if self.active_zone == "FVG" and price > poi["fvg_t"]:
+                    self.active_zone = "OB"
+                    self.state = "WAIT_C1"
+                    self.setup_time = time.time()
+                    self.fc1 = None; self.fc2 = None
+                    return
 
             if len(c_c) < 1: return
             prev = c_c[-1] 
             if prev["t"] == self.last_processed_conf_t: return
             self.last_processed_conf_t = prev["t"]
 
-            # STEP 1 — C1 (15m Close)
+            # STEP 1 — C1
             if self.state == "WAIT_C1":
                 self.fc1 = prev
-                if self.check_and_trigger("C1 Valid", c_t, c_c, 15):
-                    return
+                if self.check_and_trigger(f"C1 ({self.active_zone})", c_t, c_c, 15): return
                 self.state = "WAIT_C2"
                 
-            # STEP 2 — C2 (15m Close + Sweep Filter)
+            # STEP 2 — C2
             elif self.state == "WAIT_C2":
                 self.fc2 = prev
                 is_sweep = False
@@ -309,18 +364,21 @@ class Engine:
                 if self.direction == "SELL" and prev["h"] > self.fc1["h"]: is_sweep = True
                 
                 if is_sweep:
-                    if self.check_and_trigger("C2 Sweep Valid", c_t, c_c, 30):
-                        return
-                
-                # Lanjut ke C3 (baik karena tidak sweep, atau sweep tapi tidak ada setup 1m)
+                    if self.check_and_trigger(f"C2 Sweep ({self.active_zone})", c_t, c_c, 30): return
                 self.state = "WAIT_C3"
                 
-            # STEP 3 — C3 (Final Confirmation)
+            # STEP 3 — C3
             elif self.state == "WAIT_C3":
-                if self.check_and_trigger("C3 Retrospective", c_t, c_c, 45):
-                    return
-                self.reset()
+                if self.check_and_trigger(f"C3 Final ({self.active_zone})", c_t, c_c, 45): return
                 
+                # GAGAL. Jika FVG yang gagal, aktifkan jaring OB!
+                if self.active_zone == "FVG":
+                    self.state = "WAIT_OB_TOUCH"
+                    self.fc1 = None; self.fc2 = None
+                else:
+                    self.reset() # Jika OB juga gagal, lupakan setup ini.
+                
+        # STATE: WAIT_ENTRY
         elif self.state == "WAIT_ENTRY":
             hit_tp_sl_buy = self.direction == "BUY" and (price >= self.tp or price <= self.sl)
             hit_tp_sl_sell = self.direction == "SELL" and (price <= self.tp or price >= self.sl)
@@ -455,11 +513,15 @@ def telegram_cmd():
                     lines.append("🔍 *ANALISA AKTIF*")
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
-                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY"]]
+                    # Mengakomodasi status WAIT_OB_TOUCH juga
+                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
                     if analyzing:
                         for e in analyzing:
                             mode_clean = "1H" if "1H" in e.mode else "4H"
                             state_clean = e.state.replace('_', ' ')
+                            
+                            zone_label = getattr(e, 'active_zone', '')
+                            if zone_label: state_clean += f" ({zone_label})"
                             
                             pr = precisions.get(e.symbol, {})
                             tick = pr.get("tick", 4) if pr else 4
@@ -665,6 +727,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v6.5 (THE RETROSPECTIVE SCANNER) ACTIVE...")
+    print("🔥 BOT v6.6 (THE DUAL-ZONE DEFENDER) ACTIVE...")
     while True:
         time.sleep(1)
