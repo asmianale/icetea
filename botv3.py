@@ -172,7 +172,7 @@ class Engine:
     def __init__(self, symbol, mode):
         self.symbol = symbol
         self.mode = mode
-        self.ignored_pois = [] # --- [FIX 1]: List Blacklist POI Zombie ---
+        self.ignored_pois = []
         self.reset()
         if mode == "1H_BIAS": self.tf_poi, self.tf_conf, self.tf_trig = "1h", "15m", "1m"
         else: self.tf_poi, self.tf_conf, self.tf_trig = "4h", "1h", "5m"
@@ -269,13 +269,13 @@ class Engine:
             
         if self.setup_time and time.time() - self.setup_time > 3600:
             if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
-                if self.active_poi: self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika expired
+                if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
                 self.reset(); return
 
         if self.state == "IDLE":
             pois = get_unmitigated_poi(c_p)
             for poi in reversed(pois):
-                if poi["t"] in self.ignored_pois: continue # --- [FIX 1]: Abaikan POI yang sudah diblacklist
+                if poi["t"] in self.ignored_pois: continue
                 
                 in_fvg = poi["fvg_b"] <= price <= poi["fvg_t"]
                 in_ob = poi["ob_b"] <= price <= poi["ob_t"]
@@ -347,7 +347,7 @@ class Engine:
                     self.state = "WAIT_OB_TOUCH"
                     self.fc1 = None; self.fc2 = None
                 else: 
-                    self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika OB juga gagal total
+                    self.ignored_pois.append(self.active_poi["t"])
                     self.reset() 
                 
         elif self.state == "WAIT_ENTRY":
@@ -357,7 +357,7 @@ class Engine:
             if hit_tp_sl_buy or hit_tp_sl_sell:
                 send_telegram(f"❌ {self.symbol} [{self.mode}] Batal: Harga lari ke TP/SL duluan.")
                 self.cancel_pending_orders()
-                self.ignored_pois.append(self.active_poi["t"]) # --- [FIX 1]: Blacklist jika batal ditinggal lari
+                self.ignored_pois.append(self.active_poi["t"])
                 self.reset()
 
     def place_limit_and_sl(self):
@@ -381,9 +381,15 @@ class Engine:
                     self.pending_order_id = res["orderId"]
                     opp = "SELL" if self.direction == "BUY" else "BUY"
                     
+                    # --- [FIX ALGO]: Menambahkan algoType: CONDITIONAL dan triggerPrice ---
                     sl_params = {
-                        "symbol": self.symbol, "side": opp, "type": "STOP_MARKET", 
-                        "stopPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"
+                        "symbol": self.symbol, 
+                        "side": opp, 
+                        "algoType": "CONDITIONAL", 
+                        "type": "STOP_MARKET", 
+                        "triggerPrice": round_v(self.sl, p["tick"]), 
+                        "quantity": q_str, 
+                        "reduceOnly": "true"
                     }
                     sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
@@ -476,7 +482,7 @@ def telegram_cmd():
                             if isinstance(algo_orders, list):
                                 for o in algo_orders:
                                     o_type = o.get("type", o.get("orderType", ""))
-                                    sp = float(o.get("stopPrice", 0))
+                                    sp = float(o.get("triggerPrice", o.get("stopPrice", 0)))
                                     if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
                                     elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
@@ -573,9 +579,15 @@ def telegram_cmd():
                         opp = "SELL" if p["side"] == "BUY" else "BUY"
                         qty_str = round_v(p["qty"], pr["step"])
                         
+                        # --- [FIX ALGO]: Menambahkan algoType: CONDITIONAL dan triggerPrice untuk BEP ---
                         post_api({
-                            "symbol": s, "side": opp, "type": "STOP_MARKET", 
-                            "stopPrice": round_v(p["ep"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"
+                            "symbol": s, 
+                            "side": opp, 
+                            "algoType": "CONDITIONAL", 
+                            "type": "STOP_MARKET", 
+                            "triggerPrice": round_v(p["ep"], pr["tick"]), 
+                            "quantity": qty_str, 
+                            "reduceOnly": "true"
                         }, "/fapi/v1/algoOrder")
                         rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
@@ -644,14 +656,22 @@ def on_user_msg(ws, m):
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
                 qty_str = round_v(sig["qty"], pr["step"])
                 
+                # --- [FIX ALGO]: Menambahkan algoType: CONDITIONAL dan triggerPrice untuk TP Otomatis ---
                 params = {
-                    "symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", 
-                    "stopPrice": round_v(sig["tp"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"
+                    "symbol": s, 
+                    "side": opp, 
+                    "algoType": "CONDITIONAL", 
+                    "type": "TAKE_PROFIT_MARKET", 
+                    "triggerPrice": round_v(sig["tp"], pr["tick"]), 
+                    "quantity": qty_str,
+                    "reduceOnly": "true"
                 }
                 res = post_api(params, "/fapi/v1/algoOrder")
                 
                 if "code" in res: send_telegram(f"⚠️ ERROR BINANCE (TP {s}): {res.get('msg')}")
-                else: send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{round_v(sig['tp'], pr['tick'])}`")
+                else:
+                    tp_str = round_v(sig['tp'], pr['tick'])
+                    send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{tp_str}`")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
@@ -683,7 +703,6 @@ def on_user_msg(ws, m):
                         positions[s] = {"side": "BUY" if pa > 0 else "SELL", "qty": abs(pa), "ep": float(p["ep"])}
                         for e in engines:
                             if e.symbol == s:
-                                # --- [FIX 2]: Hapus Hantu Analisa saat posisi terbentuk & Blacklist POI yang dipakai ---
                                 if e.active_poi: e.ignored_pois.append(e.active_poi["t"])
                                 e.reset()
     except Exception as e:
@@ -746,6 +765,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v7.2 (THE LOGIC SWEEPER) ACTIVE...")
+    print("🔥 BOT v7.3 (THE ALGO FIX) ACTIVE...")
     while True:
         time.sleep(1)
