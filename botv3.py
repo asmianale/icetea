@@ -470,7 +470,12 @@ def telegram_cmd():
 
                     if positions:
                         for s, p in positions.items():
-                            cur = live_prices.get(s, p['ep'])
+                            # --- OBAT ANTI-HALU 2000% ---
+                            cur = live_prices.get(s, 0.0)
+                            if cur == 0.0: 
+                                cur = p['ep'] # Jika harga masih 0.0, paksa pakai harga Entry
+                            # ----------------------------
+
                             pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
                             margin = (p['qty'] * p['ep']) / LEVERAGE
                             pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
