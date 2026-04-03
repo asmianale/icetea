@@ -143,30 +143,26 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
         c1 = candles[i+1]
         c2 = candles[i+2]
 
-        # 🟢 BULLISH FVG + OB
         if c0["h"] < c2["l"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 fvg_b, fvg_t = c0["h"], c2["l"]
-                ob_b, ob_t = c0["l"], c0["h"] # OB ada tepat di bawah FVG
+                ob_b, ob_t = c0["l"], c0["h"] 
                 is_valid = True
                 
                 for j in range(i+3, len(candles)):
-                    # Jika harga menembus lantai OB, setup hangus total
                     if candles[j]["l"] < ob_b: 
                         is_valid = False; break 
                         
                 if is_valid: 
                     pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
-        # 🔴 BEARISH FVG + OB
         elif c0["l"] > c2["h"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 fvg_t, fvg_b = c0["l"], c2["h"]
-                ob_b, ob_t = c0["l"], c0["h"] # OB ada tepat di atas FVG
+                ob_b, ob_t = c0["l"], c0["h"] 
                 is_valid = True
                 
                 for j in range(i+3, len(candles)):
-                    # Jika harga menembus atap OB, setup hangus total
                     if candles[j]["h"] > ob_t: 
                         is_valid = False; break 
                         
@@ -232,10 +228,8 @@ class Engine:
                 
                 # BUY SETUP
                 if self.direction == "BUY" and curr["c"] > max(highs):
-                    # TERSANGKA 1 FIX: KTP Check Akar CISD
                     cisd_low = min(c["l"] for c in ltf_scan[i-5:i+1])
-                    if cisd_low > poi["fvg_t"] or cisd_low < poi["ob_b"]:
-                        continue # Batal, CISD melayang di luar zona Ibu-Anak (OB-FVG)
+                    if cisd_low > poi["fvg_t"] or cisd_low < poi["ob_b"]: continue
                         
                     self.entry = curr["c"] - (body * 0.25)
                     sl_low = cisd_low
@@ -251,10 +245,8 @@ class Engine:
                         
                 # SELL SETUP
                 elif self.direction == "SELL" and curr["c"] < min(lows):
-                    # TERSANGKA 1 FIX: KTP Check Akar CISD
                     cisd_high = max(c["h"] for c in ltf_scan[i-5:i+1])
-                    if cisd_high < poi["fvg_b"] or cisd_high > poi["ob_t"]:
-                        continue # Batal, CISD melayang di luar zona Ibu-Anak (OB-FVG)
+                    if cisd_high < poi["fvg_b"] or cisd_high > poi["ob_t"]: continue
                         
                     self.entry = curr["c"] + (body * 0.25)
                     sl_high = cisd_high
@@ -306,18 +298,18 @@ class Engine:
                     self.setup_time = time.time()
                     return
                     
-        # STATE: WAIT_OB_TOUCH (FVG Gagal, Tunggu Sentuh OB)
+        # STATE: WAIT_OB_TOUCH
         elif self.state == "WAIT_OB_TOUCH":
             poi = self.active_poi
             if self.direction == "BUY":
-                if price < poi["ob_b"]: self.reset(); return # Tembus OB, Batal!
-                if price <= poi["ob_t"]: # Menyentuh ujung OB
+                if price < poi["ob_b"]: self.reset(); return
+                if price <= poi["ob_t"]: 
                     self.active_zone = "OB"
                     self.state = "WAIT_C1"
                     self.setup_time = time.time()
             elif self.direction == "SELL":
-                if price > poi["ob_t"]: self.reset(); return # Tembus OB, Batal!
-                if price >= poi["ob_b"]: # Menyentuh ujung OB
+                if price > poi["ob_t"]: self.reset(); return
+                if price >= poi["ob_b"]: 
                     self.active_zone = "OB"
                     self.state = "WAIT_C1"
                     self.setup_time = time.time()
@@ -325,11 +317,8 @@ class Engine:
         # STATE: C1, C2, C3
         elif self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3"]:
             poi = self.active_poi
-            
-            # Cek Pelanggaran Zona Dinamis
             if self.direction == "BUY":
                 if price < poi["ob_b"]: self.reset(); return 
-                # Jatuh dari FVG langsung ke OB di tengah proses? Pindah fase!
                 if self.active_zone == "FVG" and price < poi["fvg_b"]:
                     self.active_zone = "OB"
                     self.state = "WAIT_C1"
@@ -350,13 +339,11 @@ class Engine:
             if prev["t"] == self.last_processed_conf_t: return
             self.last_processed_conf_t = prev["t"]
 
-            # STEP 1 — C1
             if self.state == "WAIT_C1":
                 self.fc1 = prev
                 if self.check_and_trigger(f"C1 ({self.active_zone})", c_t, c_c, 15): return
                 self.state = "WAIT_C2"
                 
-            # STEP 2 — C2
             elif self.state == "WAIT_C2":
                 self.fc2 = prev
                 is_sweep = False
@@ -367,18 +354,14 @@ class Engine:
                     if self.check_and_trigger(f"C2 Sweep ({self.active_zone})", c_t, c_c, 30): return
                 self.state = "WAIT_C3"
                 
-            # STEP 3 — C3
             elif self.state == "WAIT_C3":
                 if self.check_and_trigger(f"C3 Final ({self.active_zone})", c_t, c_c, 45): return
-                
-                # GAGAL. Jika FVG yang gagal, aktifkan jaring OB!
                 if self.active_zone == "FVG":
                     self.state = "WAIT_OB_TOUCH"
                     self.fc1 = None; self.fc2 = None
                 else:
-                    self.reset() # Jika OB juga gagal, lupakan setup ini.
+                    self.reset() 
                 
-        # STATE: WAIT_ENTRY
         elif self.state == "WAIT_ENTRY":
             hit_tp_sl_buy = self.direction == "BUY" and (price >= self.tp or price <= self.sl)
             hit_tp_sl_sell = self.direction == "SELL" and (price <= self.tp or price >= self.sl)
@@ -408,10 +391,12 @@ class Engine:
                 if "orderId" in res:
                     self.pending_order_id = res["orderId"]
                     opp = "SELL" if self.direction == "BUY" else "BUY"
-                    sl_params = {"algoType": "CONDITIONAL", "symbol": self.symbol, "side": opp, "type": "STOP_MARKET", "triggerPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"}
-                    sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
-                    self.pending_sl_algo_id = sl_res.get("algoId") or sl_res.get("orderId")
+                    # [API FIX] Ganti ke /order dan stopPrice
+                    sl_params = {"symbol": self.symbol, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"}
+                    sl_res = post_api(sl_params, "/fapi/v1/order")
+                    
+                    self.pending_sl_algo_id = sl_res.get("orderId")
                     msg = f"⏳ *{self.symbol}* LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: `{self.entry:.4f}`\n🛑 SL: `{self.sl:.4f}`\n🎯 TP: `{self.tp:.4f}`"
                     send_telegram(msg)
                 else: 
@@ -425,7 +410,8 @@ class Engine:
     def cancel_pending_orders(self):
         def run():
             if self.pending_order_id: post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-            if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
+            # [API FIX] Ganti ke /order
+            if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "orderId": self.pending_sl_algo_id}, "/fapi/v1/order", method="DELETE")
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
@@ -470,12 +456,9 @@ def telegram_cmd():
 
                     if positions:
                         for s, p in positions.items():
-                            # --- OBAT ANTI-HALU 2000% ---
                             cur = live_prices.get(s, 0.0)
-                            if cur == 0.0: 
-                                cur = p['ep'] # Jika harga masih 0.0, paksa pakai harga Entry
-                            # ----------------------------
-
+                            if cur == 0.0: cur = p['ep'] 
+                            
                             pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
                             margin = (p['qty'] * p['ep']) / LEVERAGE
                             pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
@@ -486,6 +469,8 @@ def telegram_cmd():
                             tick = pr.get("tick", 4) if pr else 4
                             
                             tp_val, sl_val = None, None
+                            
+                            # [API FIX] Hanya perlu tarik dari openOrders (karena semua gabung di situ)
                             orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
                             if isinstance(orders, list):
                                 for o in orders:
@@ -493,15 +478,6 @@ def telegram_cmd():
                                     sp = float(o.get("stopPrice", 0))
                                     if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
                                     elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
-
-                            if tp_val is None or sl_val is None:
-                                algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
-                                if isinstance(algo_orders, list):
-                                    for o in algo_orders:
-                                        o_type = o.get("type", "")
-                                        sp = float(o.get("stopPrice", 0))
-                                        if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
-                                        elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
                             tp_str = round_v(tp_val, tick) if tp_val else "-"
                             sl_str = round_v(sl_val, tick) if sl_val else "-"
@@ -518,7 +494,6 @@ def telegram_cmd():
                     lines.append("🔍 *ANALISA AKTIF*")
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
-                    # Mengakomodasi status WAIT_OB_TOUCH juga
                     analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
                     if analyzing:
                         for e in analyzing:
@@ -557,7 +532,6 @@ def telegram_cmd():
                         side = "SELL" if p["side"] == "BUY" else "BUY"
                         post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
-                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         rep(f"🛑 {s} ditutup paksa via Market.")
 
                 elif txt.startswith("/bep"):
@@ -566,14 +540,19 @@ def telegram_cmd():
                     to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
                     for s in to_bep:
                         p, pr = positions[s], precisions.get(s)
-                        open_algo = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
-                        if isinstance(open_algo, list):
-                            for order in open_algo:
-                                if order.get("type") == "STOP_MARKET" or order.get("origType") == "STOP_MARKET":
-                                    post_api({"symbol": s, "algoId": order.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
+                        
+                        # [API FIX] Hapus SL lama via /order
+                        orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
+                        if isinstance(orders, list):
+                            for order in orders:
+                                o_type = order.get("type", "")
+                                if o_type in ["STOP_MARKET", "STOP"]:
+                                    post_api({"symbol": s, "orderId": order.get("orderId")}, "/fapi/v1/order", method="DELETE")
+                        
                         opp = "SELL" if p["side"] == "BUY" else "BUY"
                         qty_str = round_v(p["qty"], pr["step"])
-                        post_api({"algoType": "CONDITIONAL", "symbol": s, "side": opp, "type": "STOP_MARKET", "triggerPrice": round_v(p["ep"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/algoOrder")
+                        # [API FIX] Pasang SL BEP via /order
+                        post_api({"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], pr["tick"]), "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
                         rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
                 elif txt.startswith("/help"):
@@ -640,7 +619,9 @@ def on_user_msg(ws, m):
             if o["X"] == "FILLED" and o.get("o") == "LIMIT" and s in active_signals:
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-                post_api({"algoType": "CONDITIONAL", "symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "triggerPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}, "/fapi/v1/algoOrder")
+                # [API FIX] Pasang TP otomatis via /order dan stopPrice
+                params = {"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
+                post_api(params, "/fapi/v1/order")
                 send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP dipasang otomatis di `{round_v(sig['tp'], pr['tick'])}`")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
@@ -666,7 +647,6 @@ def on_user_msg(ws, m):
                     if pa == 0:
                         positions.pop(s, None); active_signals.pop(s, None)
                         post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
-                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         for e in engines:
                             if e.symbol == s: e.reset()
                     else:
@@ -732,6 +712,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v6.6 (THE DUAL-ZONE DEFENDER) ACTIVE...")
+    print("🔥 BOT v6.7 (THE API FIXER) ACTIVE...")
     while True:
         time.sleep(1)
