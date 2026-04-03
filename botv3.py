@@ -122,7 +122,7 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — DUAL ZONE
+# LOGIKA SMC — DUAL ZONE (ANTI-ZOMBIE & FRESH FVG ONLY)
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
     if len(candles) < depth + 4: return []
@@ -131,26 +131,38 @@ def get_unmitigated_poi(candles, depth=40, min_size_pct=0.1):
 
     for i in range(start_idx, len(candles) - 3):
         c0 = candles[i]
-        c1 = candles[i+1]
+        c1 = candles[i+1] # Candle Penembus
         c2 = candles[i+2]
 
-        if c0["h"] < c2["l"]:
+        # 🟢 BULLISH FVG
+        if c0["h"] < c2["l"] and c1["c"] > c1["o"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 fvg_b, fvg_t = c0["h"], c2["l"]
                 ob_b, ob_t = c0["l"], c0["h"] 
+                
                 is_valid = True
                 for j in range(i+3, len(candles)):
-                    if candles[j]["l"] < ob_b: is_valid = False; break 
-                if is_valid: pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
+                    # Mitigated FVG / Tembus OB = Gagal
+                    if candles[j]["l"] <= fvg_b or candles[j]["l"] < ob_b: 
+                        is_valid = False; break 
+                        
+                if is_valid: 
+                    pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
-        elif c0["l"] > c2["h"]:
+        # 🔴 BEARISH FVG
+        elif c0["l"] > c2["h"] and c1["c"] < c1["o"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 fvg_t, fvg_b = c0["l"], c2["h"]
                 ob_b, ob_t = c0["l"], c0["h"] 
+                
                 is_valid = True
                 for j in range(i+3, len(candles)):
-                    if candles[j]["h"] > ob_t: is_valid = False; break 
-                if is_valid: pois.append({"dir": "SELL", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
+                    # Mitigated FVG / Tembus OB = Gagal
+                    if candles[j]["h"] >= fvg_t or candles[j]["h"] > ob_t: 
+                        is_valid = False; break 
+                        
+                if is_valid: 
+                    pois.append({"dir": "SELL", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
     return pois
 
@@ -267,10 +279,19 @@ class Engine:
         if not c_p or price == 0: return
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
+        # TIMEOUT FASE ANALISA (1 JAM)
         if self.setup_time and time.time() - self.setup_time > 3600:
             if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
                 if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
                 self.reset(); return
+
+        # TIMEOUT JARING LIMIT (2 JAM)
+        if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
+            send_telegram(f"⏳ *{self.symbol}* [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
+            self.cancel_pending_orders()
+            if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
+            self.reset()
+            return
 
         if self.state == "IDLE":
             pois = get_unmitigated_poi(c_p)
@@ -372,7 +393,6 @@ class Engine:
                     
                 post_api({"symbol": self.symbol, "leverage": LEVERAGE}, "/fapi/v1/leverage")
                 with state_lock:
-                    # [FIX 1]: Menyimpan SL juga ke dalam active_signals untuk Auto-Upgrade
                     active_signals[self.symbol] = {"mode": self.mode, "tp": self.tp, "sl": self.sl, "dir": self.direction, "qty": q_float}
                     
                 limit_params = {"symbol": self.symbol, "side": self.direction, "type": "LIMIT", "quantity": q_str, "price": round_v(self.entry, p["tick"]), "timeInForce": "GTC"}
@@ -382,17 +402,19 @@ class Engine:
                     self.pending_order_id = res["orderId"]
                     opp = "SELL" if self.direction == "BUY" else "BUY"
                     
-                    # [FIX 2]: Smart Fallback System untuk penempatan SL Jaring
-                    sl_params = {"symbol": self.symbol, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(self.sl, p["tick"]), "quantity": q_str, "reduceOnly": "true"}
-                    sl_res = post_api(sl_params, "/fapi/v1/order")
+                    sl_params = {
+                        "symbol": self.symbol, 
+                        "side": opp, 
+                        "algoType": "CONDITIONAL", 
+                        "type": "STOP_MARKET", 
+                        "triggerPrice": round_v(self.sl, p["tick"]), 
+                        "quantity": q_str, 
+                        "reduceOnly": "true"
+                    }
+                    sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
-                    if "code" in sl_res: # Jika laci standar menolak, pindah ke laci Algo
-                        sl_params.pop("stopPrice")
-                        sl_params.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(self.sl, p["tick"])})
-                        sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
-                        self.pending_sl_algo_id = sl_res.get("algoId")
-                    else:
-                        self.pending_sl_algo_id = sl_res.get("orderId")
+                    if "code" in sl_res: send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
+                    else: self.pending_sl_algo_id = sl_res.get("algoId") or sl_res.get("orderId")
                     
                     ep_str = round_v(self.entry, p["tick"])
                     sl_str = round_v(self.sl, p["tick"])
@@ -410,9 +432,7 @@ class Engine:
     def cancel_pending_orders(self):
         def run():
             if self.pending_order_id: post_api({"symbol": self.symbol, "orderId": self.pending_order_id}, "/fapi/v1/order", method="DELETE")
-            if self.pending_sl_algo_id: 
-                post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
-                post_api({"symbol": self.symbol, "orderId": self.pending_sl_algo_id}, "/fapi/v1/order", method="DELETE")
+            if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
@@ -470,7 +490,6 @@ def telegram_cmd():
                             tick = pr.get("tick", 4) if pr else 4
                             tp_val, sl_val = None, None
                             
-                            # [FIX 3]: Parsing status kebal peluru (Anti-Ghost)
                             orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
                             if isinstance(orders, list):
                                 for o in orders:
@@ -585,7 +604,6 @@ def telegram_cmd():
                         
                         opp = "SELL" if p["side"] == "BUY" else "BUY"
                         
-                        # [FIX 4]: Smart Fallback untuk fitur BEP
                         sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], pr["tick"]), "closePosition": "true"}
                         res_sl = post_api(sl_p, "/fapi/v1/order")
                         if "code" in res_sl:
@@ -659,24 +677,21 @@ def on_user_msg(ws, m):
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
                 
-                # [FIX 5: AUTO-UPGRADE] Hapus SL Lama yang lemah
                 for e in engines:
                     if e.symbol == s and e.pending_sl_algo_id:
                         post_api({"symbol": s, "orderId": e.pending_sl_algo_id}, "/fapi/v1/order", method="DELETE")
                         post_api({"symbol": s, "algoId": e.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
                 
-                # Pasang SL Baru (closePosition)
                 sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(sig["sl"], pr["tick"]), "closePosition": "true"}
                 res_sl = post_api(sl_p, "/fapi/v1/order")
-                if "code" in res_sl: # Smart Fallback
+                if "code" in res_sl:
                     sl_p.pop("stopPrice")
                     sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["sl"], pr["tick"])})
                     post_api(sl_p, "/fapi/v1/algoOrder")
 
-                # Pasang TP Baru (closePosition)
                 tp_p = {"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
                 res_tp = post_api(tp_p, "/fapi/v1/order")
-                if "code" in res_tp: # Smart Fallback
+                if "code" in res_tp:
                     tp_p.pop("stopPrice")
                     tp_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["tp"], pr["tick"])})
                     post_api(tp_p, "/fapi/v1/algoOrder")
@@ -777,6 +792,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v7.4 (THE HOLY GRAIL) ACTIVE...")
+    print("🔥 BOT v7.5 (THE MASTERPIECE) ACTIVE...")
     while True:
         time.sleep(1)
