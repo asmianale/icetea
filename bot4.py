@@ -74,14 +74,12 @@ def send_telegram(msg):
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if token and chat_id:
             try:
+                safe_msg = msg.replace("_", " ")
                 url = f"https://api.telegram.org/bot{token}/sendMessage"
-                # [FITUR BARU] Format HTML untuk menghindari error syntax markdown
-                payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
-                res = requests.post(url, json=payload, timeout=10).json()
-                if not res.get("ok"):
-                    logger.error(f"Gagal kirim ke Telegram: {res}")
+                payload = {"chat_id": chat_id, "text": safe_msg, "parse_mode": "Markdown"}
+                requests.post(url, json=payload, timeout=10)
             except Exception as e:
-                logger.error(f"Telegram error: {e}")
+                pass
     threading.Thread(target=run, daemon=True).start()
 
 precisions = {}
@@ -143,7 +141,7 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — STRICT VIRGIN FVG
+# LOGIKA SMC — STRICT VIRGIN FVG (ZERO TOUCH DENGAN PERLINDUNGAN LIVE CANDLE)
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1): 
     if len(candles) < depth + 4: return []
@@ -298,15 +296,13 @@ class Engine:
         if not c_p or price == 0: return
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
-        # TIMEOUT FASE ANALISA (1 JAM)
         if self.setup_time and time.time() - self.setup_time > 3600:
             if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
                 if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
                 self.reset(); return
 
-        # TIMEOUT JARING LIMIT (2 JAM)
         if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
-            send_telegram(f"⏳ <b>{self.symbol}</b> [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
+            send_telegram(f"⏳ *{self.symbol}* [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
             self.cancel_pending_orders()
             if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
             self.reset()
@@ -393,19 +389,14 @@ class Engine:
         elif self.state == "WAIT_ENTRY":
             # --- [FITUR BARU] THE WICK HUNTER ---
             last_k = c_t[-1] if len(c_t) > 0 else None
+            hit_tp_sl_buy = self.direction == "BUY" and (price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)))
+            hit_tp_sl_sell = self.direction == "SELL" and (price <= self.tp or price >= self.sl or (last_k and (last_k["l"] <= self.tp or last_k["h"] >= self.sl)))
             
-            if self.direction == "BUY":
-                if price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)):
-                    send_telegram(f"❌ <b>{self.symbol}</b> [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
-                    self.cancel_pending_orders()
-                    self.ignored_pois.append(self.active_poi["t"])
-                    self.reset()
-            elif self.direction == "SELL":
-                if price <= self.tp or price >= self.sl or (last_k and (last_k["l"] <= self.tp or last_k["h"] >= self.sl)):
-                    send_telegram(f"❌ <b>{self.symbol}</b> [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
-                    self.cancel_pending_orders()
-                    self.ignored_pois.append(self.active_poi["t"])
-                    self.reset()
+            if hit_tp_sl_buy or hit_tp_sl_sell:
+                send_telegram(f"❌ *{self.symbol}* [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
+                self.cancel_pending_orders()
+                self.ignored_pois.append(self.active_poi["t"])
+                self.reset()
 
     def place_limit_and_sl(self):
         def run():
@@ -445,7 +436,7 @@ class Engine:
                     ep_str = round_v(self.entry, p["tick"])
                     sl_str = round_v(self.sl, p["tick"])
                     tp_str = round_v(self.tp, p["tick"])
-                    msg = f"⏳ <b>{self.symbol}</b> LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: <code>{ep_str}</code>\n🛑 SL: <code>{sl_str}</code>\n🎯 TP: <code>{tp_str}</code>"
+                    msg = f"⏳ *{self.symbol}* LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: `{ep_str}`\n🛑 SL: `{sl_str}`\n🎯 TP: `{tp_str}`"
                     send_telegram(msg)
                 else: 
                     send_telegram(f"⚠️ ERROR BINANCE (LIMIT {self.symbol}): {res.get('msg')}")
@@ -462,7 +453,7 @@ class Engine:
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
-# 📱 TELEGRAM CMD & UTILS
+# 📱 TELEGRAM CMD & UTILS (V7.7 BASE + REMOTE CONTROL)
 # ==============================================================================
 def telegram_cmd():
     global total_pnl, total_wins, total_losses, current_month_str
@@ -482,8 +473,8 @@ def telegram_cmd():
                 txt = i.get("message", {}).get("text", "")
                 if not txt: continue
                 
-                # [FITUR BARU] Logging Terminal untuk cek apakah bot baca pesan
-                logger.info(f"📥 Command Telegram Diterima: {txt}")
+                # [FITUR BARU] Tampilkan di terminal saat bot dengar pesan
+                logger.info(f"📥 Pesan Telegram Diterima: {txt}")
                 
                 txt = txt.strip().lower()
                 def rep(msg): send_telegram(msg)
@@ -491,7 +482,7 @@ def telegram_cmd():
                 parts = txt.split()
                 cmd = parts[0]
 
-                # --- [FITUR BARU] REMOTE CONTROL (.env Updater) ---
+                # --- [FITUR BARU] REMOTE CONTROL ---
                 if cmd == "/setapi" and len(parts) > 1:
                     API_KEY = parts[1]
                     update_env_file("BINANCE_API_KEY", API_KEY)
@@ -506,52 +497,53 @@ def telegram_cmd():
                     try:
                         MARGIN_USDT = float(parts[1])
                         update_env_file("MARGIN_USDT", MARGIN_USDT)
-                        rep(f"✅ Margin diubah ke: <b>{MARGIN_USDT} USDT</b>")
-                    except ValueError:
-                        rep("⚠️ Format angka salah.")
+                        rep(f"✅ Margin diubah ke: *{MARGIN_USDT} USDT*")
+                    except: rep("⚠️ Format angka salah.")
                         
                 elif cmd == "/leverage" and len(parts) > 1:
                     try:
                         LEVERAGE = int(parts[1])
                         update_env_file("LEVERAGE", LEVERAGE)
-                        rep(f"✅ Leverage diubah ke: <b>{LEVERAGE}x</b>")
-                    except ValueError:
-                        rep("⚠️ Format angka salah.")
+                        rep(f"✅ Leverage diubah ke: *{LEVERAGE}x*")
+                    except: rep("⚠️ Format angka salah.")
                         
                 elif cmd == "/buffer" and len(parts) > 1:
                     try:
                         SL_BUFFER_PCT = float(parts[1])
                         update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
-                        rep(f"✅ SL Buffer diubah ke: <b>{SL_BUFFER_PCT}%</b>")
-                    except ValueError:
-                        rep("⚠️ Format angka salah.")
+                        rep(f"✅ SL Buffer diubah ke: *{SL_BUFFER_PCT}%*")
+                    except: rep("⚠️ Format angka salah.")
                         
                 elif cmd == "/minrr" and len(parts) > 1:
                     try:
                         MIN_RR = float(parts[1])
                         update_env_file("MIN_RR", MIN_RR)
-                        rep(f"✅ Min RR diubah ke: <b>{MIN_RR}</b>")
-                    except ValueError:
-                        rep("⚠️ Format angka salah.")
+                        rep(f"✅ Min RR diubah ke: *{MIN_RR}*")
+                    except: rep("⚠️ Format angka salah.")
 
-                # --- STANDARD COMMANDS (HTML FORMATTED) ---
+                # --- COMMANDS BAWAAN V7.7 ---
                 elif txt.startswith("/pnl"):
                     total_trades = total_wins + total_losses
                     wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
                     mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
-                    msg = f"📊 <b>PnL {current_month_str}</b>\n💰 Total: <code>{total_pnl:.4f} USDT</code>\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
+                    msg = f"📊 *PnL {current_month_str}*\n💰 Total: `{total_pnl:.4f} USDT`\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
                     rep(msg)
                 
                 elif txt in ["/mode 1h", "/mode 4h", "/mode double"]:
                     config["ENABLE_1H"] = txt in ["/mode 1h", "/mode double"]
                     config["ENABLE_4H"] = txt in ["/mode 4h", "/mode double"]
                     for e in engines: e.cancel_pending_orders(); e.reset()
-                    rep(f"✅ Mode diubah ke: <b>{txt.upper()}</b>")
+                    rep(f"✅ Mode diubah ke: {txt.upper()}")
 
                 elif txt.startswith("/status"):
-                    lines = ["📊 <b>STATUS BOT</b>\n"]
+                    lines = ["📊 *STATUS BOT*\n"]
+                    
+                    lines.append("⚙️ *CONFIG AKTIF*")
+                    lines.append(f"   Margin: `{MARGIN_USDT}` | Lev: `{LEVERAGE}x`")
+                    lines.append(f"   Buffer: `{SL_BUFFER_PCT}%` | MinRR: `{MIN_RR}`\n")
+                    
                     lines.append("━━━━━━━━━━━━━━━━━━━")
-                    lines.append("📈 <b>POSISI FLOATING</b>")
+                    lines.append("📈 *POSISI FLOATING*")
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
                     if positions:
@@ -597,17 +589,17 @@ def telegram_cmd():
                                     rr = reward / risk
                                     rr_str = f"1 : {rr:.2f}"
 
-                            lines.append(f"{emo} <b>{s}</b> ({p['side']})")
-                            lines.append(f"   Entry : <code>{p['ep']}</code>")
-                            lines.append(f"   TP    : <code>{tp_str}</code>")
-                            lines.append(f"   SL    : <code>{sl_str}</code>")
-                            lines.append(f"   PnL   : <code>{sign}{pnl:.2f} USDT</code> (<code>{sign}{pnl_pct:.2f}%</code>)")
-                            lines.append(f"   RR    : <code>{rr_str}</code>\n")
+                            lines.append(f"{emo} *{s}* ({p['side']})")
+                            lines.append(f"   Entry : `{p['ep']}`")
+                            lines.append(f"   TP    : `{tp_str}`")
+                            lines.append(f"   SL    : `{sl_str}`")
+                            lines.append(f"   PnL   : `{sign}{pnl:.2f} USDT` (`{sign}{pnl_pct:.2f}%`)")
+                            lines.append(f"   RR    : `{rr_str}`\n")
                     else:
                         lines.append("💤 Tidak ada posisi aktif.\n")
 
                     lines.append("━━━━━━━━━━━━━━━━━━━")
-                    lines.append("🔍 <b>ANALISA AKTIF</b>")
+                    lines.append("🔍 *ANALISA AKTIF*")
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
                     analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
@@ -633,16 +625,16 @@ def telegram_cmd():
                                     rr = reward / risk
                                     rr_str = f"1 : {rr:.2f}"
 
-                            lines.append(f"• <b>{e.symbol}</b> ({mode_clean})")
-                            lines.append(f"  Bias  : <code>{state_clean}</code>")
+                            lines.append(f"• *{e.symbol}* ({mode_clean})")
+                            lines.append(f"  Bias  : `{state_clean}`")
                             
                             if e.state == "WAIT_ENTRY" and e.entry:
-                                lines.append(f"  Entry : <code>{round_v(e.entry, tick)}</code>")
+                                lines.append(f"  Entry : `{round_v(e.entry, tick)}`")
                                 
-                            lines.append(f"  TP    : <code>{tp_str}</code>")
-                            lines.append(f"  SL    : <code>{sl_str}</code>")
+                            lines.append(f"  TP    : `{tp_str}`")
+                            lines.append(f"  SL    : `{sl_str}`")
                             if e.state == "WAIT_ENTRY":
-                                lines.append(f"  RR    : <code>{rr_str}</code>")
+                                lines.append(f"  RR    : `{rr_str}`")
                             lines.append("")
                     else:
                         lines.append("💤 Semua koin sedang IDLE.\n")
@@ -690,10 +682,10 @@ def telegram_cmd():
                             sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(p["ep"], pr["tick"])})
                             post_api(sl_p, "/fapi/v1/algoOrder")
                         
-                        rep(f"🛡️ <b>{s}</b> Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
+                        rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
                 elif txt.startswith("/help"):
-                    msg = "<b>📖 Commands:</b>\n/setapi <api>\n/setsecret <secret>\n/margin <angka>\n/leverage <angka>\n/buffer <angka>\n/minrr <angka>\n/status — Status bot\n/pnl — PnL bulan ini\n/mode <1h/4h/double> — Ubah Mode\n/close <koin/all> — Tutup Posisi\n/bep <koin/all> — SL ke Entry"
+                    msg = "*📖 COMMANDS:*\n`/setapi <api>`\n`/setsecret <secret>`\n`/margin <angka>`\n`/leverage <angka>`\n`/buffer <angka>`\n`/minrr <angka>`\n`/status` — Status bot\n`/pnl` — PnL bulan ini\n`/mode 1h/4h/double` — Ubah Mode\n`/close koin/all` — Tutup Posisi\n`/bep koin/all` — SL ke Entry"
                     rep(msg)
         except Exception as e:
             time.sleep(5)
@@ -777,7 +769,7 @@ def on_user_msg(ws, m):
                 
                 tp_str = round_v(sig['tp'], pr['tick'])
                 sl_str = round_v(sig['sl'], pr['tick'])
-                send_telegram(f"🚀 <b>{s}</b> LIMIT FILLED!\nTP: <code>{tp_str}</code> | SL: <code>{sl_str}</code> (Auto-Attached)")
+                send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP: `{tp_str}` | SL: `{sl_str}` (Auto-Attached)")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
@@ -794,15 +786,13 @@ def on_user_msg(ws, m):
                 elif order_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] or orig_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"]:
                     reason = "Hit Take Profit 🎯"
                 else:
-                    if rp > 0:
-                        reason = "Hit Take Profit 🎯 (Algo Trigger)"
-                    else:
-                        reason = "Hit Stop Loss 🛑 (Wick Sweep/Jarum)"
+                    if rp > 0: reason = "Hit Take Profit 🎯 (Algo Trigger)"
+                    else: reason = "Hit Stop Loss 🛑 (Wick Sweep/Jarum)"
                 
                 mode = active_signals.get(s, {}).get("mode", "UNKNOWN")
                 log_trade(s, o["S"], rp, mode)
                 emo = "✅" if rp > 0 else "❌"
-                send_telegram(f"{emo} <b>{s}</b> CLOSED!\nReason: {reason}\nPnL: <code>{rp:+.4f} USDT</code>")
+                send_telegram(f"{emo} *{s}* CLOSED!\nReason: {reason}\nPnL: `{rp:+.4f} USDT`")
 
         if d.get("e") == "ACCOUNT_UPDATE":
             for p in d["a"]["P"]:
@@ -880,6 +870,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v8.7 (THE BULLETPROOF HYBRID) ACTIVE...")
+    print("🔥 BOT v8.8 (THE V7.7 MASTERPIECE) ACTIVE...")
     while True:
         time.sleep(1)
