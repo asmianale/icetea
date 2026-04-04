@@ -151,7 +151,7 @@ def get_target(candles, direction, depth=20):
         return lows[-1] if lows else None
 
 # ==============================================================================
-# ENGINE (V8.2 CORE)
+# ENGINE CORE
 # ==============================================================================
 class Engine:
     def __init__(self, symbol, mode):
@@ -285,7 +285,7 @@ class Engine:
         if self.pending_sl_algo_id: post_api({"symbol": self.symbol, "algoId": self.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
 
 # ==============================================================================
-# 📱 TELEGRAM CMD (V8.3)
+# 📱 TELEGRAM CMD (V8.3.2) - FULLY RESTORED
 # ==============================================================================
 def telegram_cmd():
     global total_pnl, total_wins, total_losses, API_KEY, SECRET_KEY, MARGIN_USDT, LEVERAGE, SL_BUFFER_PCT, MIN_RR
@@ -328,30 +328,80 @@ def telegram_cmd():
                     MIN_RR = float(args[1])
                     update_env_file("MIN_RR", MIN_RR)
                     rep(f"✅ Min RR diubah ke: {MIN_RR}")
+                    
+                # --- [RESTORED] STATUS & ANALISA AKTIF ---
                 elif cmd == "/status":
-                    lines = ["📊 *STATUS BOT V8.3*\n", "⚙️ *CONFIG:*", f"   Margin: `{MARGIN_USDT}` | Lev: `{LEVERAGE}x`", f"   Buffer: `{SL_BUFFER_PCT}%` | MinRR: `{MIN_RR}`\n"]
+                    lines = ["📊 *STATUS BOT V8.3.2*\n", "⚙️ *CONFIG:*", f"   Margin: `{MARGIN_USDT}` | Lev: `{LEVERAGE}x`", f"   Buffer: `{SL_BUFFER_PCT}%` | MinRR: `{MIN_RR}`\n"]
+                    lines.append("📈 *POSISI FLOATING*")
                     if positions:
                         for s, p in positions.items():
                             cur = live_prices.get(s, 0.0)
-                            if cur == 0.0: 
-                                cur = p['ep'] 
+                            if cur == 0.0: cur = p['ep'] 
                             pnl = (cur-p['ep'])*p['qty'] if p['side']=="BUY" else (p['ep']-cur)*p['qty']
-                            lines.append(f"{'🟩' if pnl>0 else '🟥'} *{s}* ({p['side']})\n   PnL: `{pnl:+.2f} USDT` (`{((pnl/((p['qty']*p['ep'])/LEVERAGE))*100):+.2f}%`)\n")
+                            margin_dipakai = (p['qty'] * p['ep']) / LEVERAGE
+                            pnl_pct = (pnl / margin_dipakai) * 100 if margin_dipakai > 0 else 0
+                            lines.append(f"{'🟩' if pnl>0 else '🟥'} *{s}* ({p['side']})\n   Entry: `{p['ep']}`\n   PnL: `{pnl:+.2f} USDT` (`{pnl_pct:+.2f}%`)\n")
                     else: 
                         lines.append("💤 Tidak ada posisi aktif.\n")
+                        
+                    lines.append("🔍 *ANALISA AKTIF*")
+                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
+                    if analyzing:
+                        for e in analyzing:
+                            state_clean = e.state.replace('_', ' ') + (f" ({e.active_zone})" if e.active_zone else "")
+                            lines.append(f"• *{e.symbol}* ({'1H' if '1H' in e.mode else '4H'})\n  Bias: `{state_clean}`")
+                    else:
+                        lines.append("💤 Semua koin sedang IDLE.")
                     rep("\n".join(lines).strip())
+                    
+                # --- [RESTORED] PNL ---
                 elif cmd == "/pnl":
                     rep(f"📊 *PnL Bulan Ini*\n💰 Total: `{total_pnl:.4f} USDT`\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}")
+                    
+                # --- [RESTORED] CLOSE ---
                 elif cmd.startswith("/close"):
-                    target = args[1].upper() if len(args)>1 else "ALL"
-                    if target != "ALL" and not target.endswith("USDT"): 
-                        target += "USDT"
-                    for s in ([s for s in positions] if target=="ALL" else ([target] if target in positions else [])):
+                    target = args[1].upper() if len(args) > 1 else "ALL"
+                    if target != "ALL" and not target.endswith("USDT"): target += "USDT"
+                    to_close = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
+                    for s in to_close:
                         p = positions[s]
-                        post_api({"symbol": s, "side": "SELL" if p["side"]=="BUY" else "BUY", "type": "MARKET", "quantity": round_v(p["qty"], precisions[s]["step"]), "reduceOnly": "true"}, "/fapi/v1/order")
+                        pr = precisions.get(s)
+                        post_api({"symbol": s, "side": "SELL" if p["side"] == "BUY" else "BUY", "type": "MARKET", "quantity": round_v(p["qty"], pr["step"]), "reduceOnly": "true"}, "/fapi/v1/order")
+                        post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
+                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
                         rep(f"🛑 {s} ditutup paksa.")
+                        
+                # --- [RESTORED] BEP (SL ke Entry) ---
+                elif cmd.startswith("/bep"):
+                    target = args[1].upper() if len(args) > 1 else "ALL"
+                    if target != "ALL" and not target.endswith("USDT"): target += "USDT"
+                    to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
+                    for s in to_bep:
+                        p = positions[s]
+                        pr = precisions.get(s)
+                        
+                        # Hapus SL lama
+                        for o in post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET") or []:
+                            if o.get("origType", o.get("type", "")) in ["STOP_MARKET", "STOP"]:
+                                post_api({"symbol": s, "orderId": o.get("orderId")}, "/fapi/v1/order", method="DELETE")
+                        for o in post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET") or []:
+                            if o.get("origType", o.get("type", o.get("orderType", ""))) in ["STOP_MARKET", "STOP"]:
+                                post_api({"symbol": s, "algoId": o.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
+                        
+                        # Pasang SL Baru di harga Entry
+                        opp = "SELL" if p["side"] == "BUY" else "BUY"
+                        sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], pr["tick"]), "closePosition": "true"}
+                        res_sl = post_api(sl_p, "/fapi/v1/order")
+                        if "code" in res_sl:
+                            sl_p.pop("stopPrice")
+                            sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(p["ep"], pr["tick"])})
+                            post_api(sl_p, "/fapi/v1/algoOrder")
+                        
+                        rep(f"🛡️ {s} BEP Aktif! SL dipindah ke Entry.")
+
+                # --- HELP ---
                 elif cmd == "/help":
-                    rep("*📖 REMOTE CONTROL:* \n/setapi <val>\n/setsecret <val>\n/margin <val>\n/leverage <val>\n/buffer <val>\n/minrr <val>\n\n*📊 MONITOR:* \n/status, /pnl, /close <koin/all>")
+                    rep("*📖 REMOTE CONTROL:* \n/setapi <val>\n/setsecret <val>\n/margin <val>\n/leverage <val>\n/buffer <val>\n/minrr <val>\n\n*📊 MONITOR:* \n/status\n/pnl\n/close <koin/all>\n/bep <koin/all>")
         except: 
             time.sleep(5)
 
@@ -378,7 +428,7 @@ def on_user_msg(ws, m):
                 ort = o.get("ot", o.get("o"))
                 if ot in ["STOP_MARKET", "STOP"] or ort in ["STOP_MARKET", "STOP"]: reason = "Hit Stop Loss 🛑"
                 elif ot in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"]: reason = "Hit Take Profit 🎯"
-                else: reason = "Profit Taken 🎯" if rp > 0 else "Wick Sweep 🛑"
+                else: reason = "Profit Taken 🎯" if rp > 0 else "Wick Sweep / Manual 🛑"
                 
                 send_telegram(f"{emo} *{s}* CLOSED!\nReason: {reason}\nPnL: `{rp:+.4f} USDT`")
         if d.get("e") == "ACCOUNT_UPDATE":
@@ -433,5 +483,5 @@ def start():
 engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v8.3.1 (SYNTAX FIXED) ACTIVE...")
+    print("🔥 BOT v8.3.2 (THE COMPLETE CONTROLLER) ACTIVE...")
     while True: time.sleep(1)
