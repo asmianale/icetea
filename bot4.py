@@ -8,7 +8,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("SMC_Bot")
 
-# --- CONFIG (GLOBAL MUTABLE) ---
+# --- CONFIG ---
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 MODE = os.getenv("MODE", "TESTNET")
@@ -17,7 +17,7 @@ WS_BASE = "wss://stream.binancefuture.com" if MODE == "TESTNET" else "wss://fstr
 MARGIN_USDT = float(os.getenv("MARGIN_USDT", 1.0))
 LEVERAGE = int(os.getenv("LEVERAGE", 10))
 MIN_RR = float(os.getenv("MIN_RR", 1.5))
-SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", 0.15))
+SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", 0.05))
 
 symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT", "AVAXUSDT", "BNBUSDT", "TRXUSDT"]
 
@@ -35,7 +35,7 @@ total_losses = 0
 current_month_str = datetime.now().strftime("%Y-%m")
 state_lock = threading.Lock()
 
-# --- ENV UPDATER ---
+# --- [FITUR BARU] ENV UPDATER ---
 def update_env_file(key, value):
     env_path = ".env"
     lines = []
@@ -75,13 +75,13 @@ def send_telegram(msg):
         if token and chat_id:
             try:
                 url = f"https://api.telegram.org/bot{token}/sendMessage"
-                # [V8.5: PINDAH KE MODE HTML AGAR ANTI GAGAL]
+                # [FITUR BARU] Format HTML untuk menghindari error syntax markdown
                 payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
                 res = requests.post(url, json=payload, timeout=10).json()
                 if not res.get("ok"):
                     logger.error(f"Gagal kirim ke Telegram: {res}")
             except Exception as e:
-                logger.error(f"Koneksi Telegram Error: {e}")
+                logger.error(f"Telegram error: {e}")
     threading.Thread(target=run, daemon=True).start()
 
 precisions = {}
@@ -143,7 +143,7 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — STRICT VIRGIN FVG 
+# LOGIKA SMC — STRICT VIRGIN FVG
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1): 
     if len(candles) < depth + 4: return []
@@ -152,9 +152,10 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
 
     for i in range(start_idx, len(candles) - 3):
         c0 = candles[i]
-        c1 = candles[i+1]
+        c1 = candles[i+1] # Candle Momentum
         c2 = candles[i+2]
 
+        # 🟢 BULLISH FVG
         if c0["h"] < c2["l"] and c1["c"] > c1["o"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 fvg_b, fvg_t = c0["h"], c2["l"]
@@ -168,6 +169,7 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                 if is_valid: 
                     pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
+        # 🔴 BEARISH FVG
         elif c0["l"] > c2["h"] and c1["c"] < c1["o"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 fvg_t, fvg_b = c0["l"], c2["h"]
@@ -180,6 +182,7 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                         
                 if is_valid: 
                     pois.append({"dir": "SELL", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
+
     return pois
 
 def get_target(candles, direction, depth=20):
@@ -246,8 +249,7 @@ class Engine:
                     if self.sl >= self.entry: continue 
                     
                     self.tp = get_target(c_conf, self.direction)
-                    if not self.tp or self.tp <= self.entry: 
-                        self.tp = self.entry + ((self.entry - self.sl) * 2.0)
+                    if not self.tp or self.tp <= self.entry: self.tp = self.entry + ((self.entry - self.sl) * 2.0)
                     
                     risk = self.entry - self.sl
                     reward = self.tp - self.entry
@@ -267,8 +269,7 @@ class Engine:
                     if self.sl <= self.entry: continue
                     
                     self.tp = get_target(c_conf, self.direction)
-                    if not self.tp or self.tp >= self.entry: 
-                        self.tp = self.entry - ((self.sl - self.entry) * 2.0)
+                    if not self.tp or self.tp >= self.entry: self.tp = self.entry - ((self.sl - self.entry) * 2.0)
                     
                     risk = self.sl - self.entry
                     reward = self.entry - self.tp
@@ -297,13 +298,15 @@ class Engine:
         if not c_p or price == 0: return
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
+        # TIMEOUT FASE ANALISA (1 JAM)
         if self.setup_time and time.time() - self.setup_time > 3600:
             if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
                 if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
                 self.reset(); return
 
+        # TIMEOUT JARING LIMIT (2 JAM)
         if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
-            send_telegram(f"⏳ <b>{self.symbol}</b> [{self.mode}] Batal: Jaring Limit kadaluarsa.")
+            send_telegram(f"⏳ <b>{self.symbol}</b> [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
             self.cancel_pending_orders()
             if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
             self.reset()
@@ -388,14 +391,18 @@ class Engine:
                     self.reset() 
                 
         elif self.state == "WAIT_ENTRY":
+            # --- [FITUR BARU] THE WICK HUNTER ---
             last_k = c_t[-1] if len(c_t) > 0 else None
+            
             if self.direction == "BUY":
                 if price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)):
+                    send_telegram(f"❌ <b>{self.symbol}</b> [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
                     self.cancel_pending_orders()
                     self.ignored_pois.append(self.active_poi["t"])
                     self.reset()
             elif self.direction == "SELL":
                 if price <= self.tp or price >= self.sl or (last_k and (last_k["l"] <= self.tp or last_k["h"] >= self.sl)):
+                    send_telegram(f"❌ <b>{self.symbol}</b> [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
                     self.cancel_pending_orders()
                     self.ignored_pois.append(self.active_poi["t"])
                     self.reset()
@@ -432,7 +439,7 @@ class Engine:
                     }
                     sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
-                    if "code" in sl_res: logger.error(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
+                    if "code" in sl_res: send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
                     else: self.pending_sl_algo_id = sl_res.get("algoId") or sl_res.get("orderId")
                     
                     ep_str = round_v(self.entry, p["tick"])
@@ -441,7 +448,7 @@ class Engine:
                     msg = f"⏳ <b>{self.symbol}</b> LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: <code>{ep_str}</code>\n🛑 SL: <code>{sl_str}</code>\n🎯 TP: <code>{tp_str}</code>"
                     send_telegram(msg)
                 else: 
-                    logger.error(f"⚠️ ERROR BINANCE (LIMIT {self.symbol}): {res.get('msg')}")
+                    send_telegram(f"⚠️ ERROR BINANCE (LIMIT {self.symbol}): {res.get('msg')}")
                     with state_lock: active_signals.pop(self.symbol, None)
                     self.reset()
             except Exception as e:
@@ -455,16 +462,14 @@ class Engine:
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
-# 📱 TELEGRAM CMD (V8.5 - HTML + LOGGING TERMINAL)
+# 📱 TELEGRAM CMD & UTILS
 # ==============================================================================
 def telegram_cmd():
     global total_pnl, total_wins, total_losses, current_month_str
     global API_KEY, SECRET_KEY, MARGIN_USDT, LEVERAGE, SL_BUFFER_PCT, MIN_RR
     
     t = os.getenv("TELEGRAM_TOKEN")
-    if not t: 
-        logger.error("🚨 TELEGRAM_TOKEN TIDAK DITEMUKAN DI .env!")
-        return
+    if not t: return
         
     lid = 0
     while True:
@@ -474,205 +479,223 @@ def telegram_cmd():
             
             for i in r.get("result", []):
                 lid = i["update_id"] + 1
-                msg_obj = i.get("message", {})
-                txt = msg_obj.get("text", "")
-                
+                txt = i.get("message", {}).get("text", "")
                 if not txt: continue
-                logger.info(f"📥 Pesan Telegram diterima: {txt}") # LOG KE TERMINAL
                 
-                txt_lower = txt.strip().lower()
+                # [FITUR BARU] Logging Terminal untuk cek apakah bot baca pesan
+                logger.info(f"📥 Command Telegram Diterima: {txt}")
+                
+                txt = txt.strip().lower()
                 def rep(msg): send_telegram(msg)
 
-                try:
-                    parts = txt_lower.split()
-                    cmd = parts[0]
+                parts = txt.split()
+                cmd = parts[0]
 
-                    if cmd == "/setapi" and len(parts) > 1:
-                        API_KEY = parts[1]
-                        update_env_file("BINANCE_API_KEY", API_KEY)
-                        rep("✅ API KEY Berhasil diperbarui!")
-                        
-                    elif cmd == "/setsecret" and len(parts) > 1:
-                        SECRET_KEY = parts[1]
-                        update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
-                        rep("✅ SECRET KEY Berhasil diperbarui!")
-                        
-                    elif cmd == "/margin" and len(parts) > 1:
+                # --- [FITUR BARU] REMOTE CONTROL (.env Updater) ---
+                if cmd == "/setapi" and len(parts) > 1:
+                    API_KEY = parts[1]
+                    update_env_file("BINANCE_API_KEY", API_KEY)
+                    rep("✅ API KEY Berhasil diperbarui!")
+                    
+                elif cmd == "/setsecret" and len(parts) > 1:
+                    SECRET_KEY = parts[1]
+                    update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
+                    rep("✅ SECRET KEY Berhasil diperbarui!")
+                    
+                elif cmd == "/margin" and len(parts) > 1:
+                    try:
                         MARGIN_USDT = float(parts[1])
                         update_env_file("MARGIN_USDT", MARGIN_USDT)
                         rep(f"✅ Margin diubah ke: <b>{MARGIN_USDT} USDT</b>")
+                    except ValueError:
+                        rep("⚠️ Format angka salah.")
                         
-                    elif cmd == "/leverage" and len(parts) > 1:
+                elif cmd == "/leverage" and len(parts) > 1:
+                    try:
                         LEVERAGE = int(parts[1])
                         update_env_file("LEVERAGE", LEVERAGE)
                         rep(f"✅ Leverage diubah ke: <b>{LEVERAGE}x</b>")
+                    except ValueError:
+                        rep("⚠️ Format angka salah.")
                         
-                    elif cmd == "/buffer" and len(parts) > 1:
+                elif cmd == "/buffer" and len(parts) > 1:
+                    try:
                         SL_BUFFER_PCT = float(parts[1])
                         update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
                         rep(f"✅ SL Buffer diubah ke: <b>{SL_BUFFER_PCT}%</b>")
+                    except ValueError:
+                        rep("⚠️ Format angka salah.")
                         
-                    elif cmd == "/minrr" and len(parts) > 1:
+                elif cmd == "/minrr" and len(parts) > 1:
+                    try:
                         MIN_RR = float(parts[1])
                         update_env_file("MIN_RR", MIN_RR)
                         rep(f"✅ Min RR diubah ke: <b>{MIN_RR}</b>")
+                    except ValueError:
+                        rep("⚠️ Format angka salah.")
 
-                    elif cmd == "/pnl":
-                        total_trades = total_wins + total_losses
-                        wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
-                        mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
-                        msg = f"📊 <b>PnL {current_month_str}</b>\n💰 Total: <code>{total_pnl:.4f} USDT</code>\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
-                        rep(msg)
-                    
-                    elif cmd in ["/mode 1h", "/mode 4h", "/mode double"]:
-                        config["ENABLE_1H"] = cmd in ["/mode 1h", "/mode double"]
-                        config["ENABLE_4H"] = cmd in ["/mode 4h", "/mode double"]
-                        for e in engines: e.cancel_pending_orders(); e.reset()
-                        rep(f"✅ Mode diubah ke: <b>{cmd.upper()}</b>")
+                # --- STANDARD COMMANDS (HTML FORMATTED) ---
+                elif txt.startswith("/pnl"):
+                    total_trades = total_wins + total_losses
+                    wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
+                    mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
+                    msg = f"📊 <b>PnL {current_month_str}</b>\n💰 Total: <code>{total_pnl:.4f} USDT</code>\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
+                    rep(msg)
+                
+                elif txt in ["/mode 1h", "/mode 4h", "/mode double"]:
+                    config["ENABLE_1H"] = txt in ["/mode 1h", "/mode double"]
+                    config["ENABLE_4H"] = txt in ["/mode 4h", "/mode double"]
+                    for e in engines: e.cancel_pending_orders(); e.reset()
+                    rep(f"✅ Mode diubah ke: <b>{txt.upper()}</b>")
 
-                    elif cmd == "/status":
-                        lines = ["📊 <b>STATUS BOT V8.5</b>\n"]
-                        lines.append("⚙️ <b>CONFIG AKTIF</b>")
-                        lines.append(f"   Margin: <code>{MARGIN_USDT}</code> | Lev: <code>{LEVERAGE}x</code>")
-                        lines.append(f"   Buffer: <code>{SL_BUFFER_PCT}%</code> | MinRR: <code>{MIN_RR}</code>\n")
-                        lines.append("━━━━━━━━━━━━━━━━━━━")
-                        lines.append("📈 <b>POSISI FLOATING</b>")
-                        lines.append("━━━━━━━━━━━━━━━━━━━\n")
+                elif txt.startswith("/status"):
+                    lines = ["📊 <b>STATUS BOT</b>\n"]
+                    lines.append("━━━━━━━━━━━━━━━━━━━")
+                    lines.append("📈 <b>POSISI FLOATING</b>")
+                    lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
-                        if positions:
-                            for s, p in positions.items():
-                                cur = live_prices.get(s, 0.0)
-                                if cur == 0.0: cur = p['ep'] 
-                                
-                                pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
-                                margin = (p['qty'] * p['ep']) / LEVERAGE
-                                pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
-                                sign = "+" if pnl > 0 else ""
-                                emo = "🟩" if pnl > 0 else "🟥"
-
-                                pr = precisions.get(s, {})
-                                tick = pr.get("tick", 4) if pr else 4
-                                tp_val, sl_val = None, None
-                                
-                                orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
-                                if isinstance(orders, list):
-                                    for o in orders:
-                                        o_type = o.get("origType", o.get("type", ""))
-                                        sp = float(o.get("stopPrice", 0))
-                                        if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
-                                        elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
-
-                                algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
-                                if isinstance(algo_orders, list):
-                                    for o in algo_orders:
-                                        o_type = o.get("origType", o.get("type", o.get("orderType", "")))
-                                        sp = float(o.get("triggerPrice", o.get("stopPrice", 0)))
-                                        if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
-                                        elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
-
-                                tp_str = round_v(tp_val, tick) if tp_val else "-"
-                                sl_str = round_v(sl_val, tick) if sl_val else "-"
-
-                                rr_str = "-"
-                                if tp_val and sl_val:
-                                    ep = p['ep']
-                                    risk = (ep - sl_val) if p['side'] == "BUY" else (sl_val - ep)
-                                    reward = (tp_val - ep) if p['side'] == "BUY" else (ep - tp_val)
-                                    if risk > 0: rr_str = f"1 : {reward / risk:.2f}"
-
-                                lines.append(f"{emo} <b>{s}</b> ({p['side']})")
-                                lines.append(f"   Entry : <code>{p['ep']}</code>")
-                                lines.append(f"   TP    : <code>{tp_str}</code>")
-                                lines.append(f"   SL    : <code>{sl_str}</code>")
-                                lines.append(f"   PnL   : <code>{sign}{pnl:.2f} USDT</code> (<code>{sign}{pnl_pct:.2f}%</code>)")
-                                lines.append(f"   RR    : <code>{rr_str}</code>\n")
-                        else:
-                            lines.append("💤 Tidak ada posisi aktif.\n")
-
-                        lines.append("━━━━━━━━━━━━━━━━━━━")
-                        lines.append("🔍 <b>ANALISA AKTIF</b>")
-                        lines.append("━━━━━━━━━━━━━━━━━━━\n")
-
-                        analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
-                        if analyzing:
-                            for e in analyzing:
-                                mode_clean = "1H" if "1H" in e.mode else "4H"
-                                state_clean = e.state.replace('_', ' ')
-                                zone_label = getattr(e, 'active_zone', '')
-                                if zone_label: state_clean += f" ({zone_label})"
-                                
-                                pr = precisions.get(e.symbol, {})
-                                tick = pr.get("tick", 4) if pr else 4
-                                tp_str = round_v(e.tp, tick) if e.tp else "-"
-                                sl_str = round_v(e.sl, tick) if e.sl else "-"
-
-                                lines.append(f"• <b>{e.symbol}</b> ({mode_clean})")
-                                lines.append(f"  Bias  : <code>{state_clean}</code>")
-                                if e.state == "WAIT_ENTRY" and e.entry:
-                                    lines.append(f"  Entry : <code>{round_v(e.entry, tick)}</code>")
-                                lines.append(f"  TP    : <code>{tp_str}</code>")
-                                lines.append(f"  SL    : <code>{sl_str}</code>\n")
-                        else:
-                            lines.append("💤 Semua koin sedang IDLE.\n")
-
-                        rep("\n".join(lines).strip())
-
-                    elif cmd == "/close":
-                        target = parts[1].upper() if len(parts) > 1 else "ALL"
-                        if target != "ALL" and not target.endswith("USDT"): target += "USDT"
-                        
-                        to_close = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
-                        for s in to_close:
-                            p = positions[s]
-                            pr = precisions.get(s)
-                            qty_str = round_v(p["qty"], pr["step"]) if pr else str(p["qty"])
-                            side = "SELL" if p["side"] == "BUY" else "BUY"
+                    if positions:
+                        for s, p in positions.items():
+                            cur = live_prices.get(s, 0.0)
+                            if cur == 0.0: cur = p['ep'] 
                             
-                            post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
-                            post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
-                            post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
-                            rep(f"🛑 <b>{s}</b> ditutup paksa via Market.")
+                            pnl = (cur - p['ep']) * p['qty'] if p['side'] == "BUY" else (p['ep'] - cur) * p['qty']
+                            margin = (p['qty'] * p['ep']) / LEVERAGE
+                            pnl_pct = (pnl / margin) * 100 if margin > 0 else 0
+                            sign = "+" if pnl > 0 else ""
+                            emo = "🟩" if pnl > 0 else "🟥"
 
-                    elif cmd == "/bep":
-                        target = parts[1].upper() if len(parts) > 1 else "ALL"
-                        if target != "ALL" and not target.endswith("USDT"): target += "USDT"
-                        
-                        to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
-                        for s in to_bep:
-                            p = positions[s]
-                            pr = precisions.get(s)
-                            tick = pr["tick"] if pr else 4
+                            pr = precisions.get(s, {})
+                            tick = pr.get("tick", 4) if pr else 4
+                            tp_val, sl_val = None, None
                             
                             orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
                             if isinstance(orders, list):
                                 for o in orders:
-                                    if o.get("origType", o.get("type", "")) in ["STOP_MARKET", "STOP"]:
-                                        post_api({"symbol": s, "orderId": o.get("orderId")}, "/fapi/v1/order", method="DELETE")
+                                    o_type = o.get("origType", o.get("type", ""))
+                                    sp = float(o.get("stopPrice", 0))
+                                    if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
+                                    elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
 
                             algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
                             if isinstance(algo_orders, list):
                                 for o in algo_orders:
-                                    if o.get("origType", o.get("type", o.get("orderType", ""))) in ["STOP_MARKET", "STOP"]:
-                                        post_api({"symbol": s, "algoId": o.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
+                                    o_type = o.get("origType", o.get("type", o.get("orderType", "")))
+                                    sp = float(o.get("triggerPrice", o.get("stopPrice", 0)))
+                                    if o_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] and sp > 0: tp_val = sp
+                                    elif o_type in ["STOP_MARKET", "STOP"] and sp > 0: sl_val = sp
+
+                            tp_str = round_v(tp_val, tick) if tp_val else "-"
+                            sl_str = round_v(sl_val, tick) if sl_val else "-"
+
+                            rr_str = "-"
+                            if tp_val and sl_val:
+                                ep = p['ep']
+                                risk = (ep - sl_val) if p['side'] == "BUY" else (sl_val - ep)
+                                reward = (tp_val - ep) if p['side'] == "BUY" else (ep - tp_val)
+                                if risk > 0:
+                                    rr = reward / risk
+                                    rr_str = f"1 : {rr:.2f}"
+
+                            lines.append(f"{emo} <b>{s}</b> ({p['side']})")
+                            lines.append(f"   Entry : <code>{p['ep']}</code>")
+                            lines.append(f"   TP    : <code>{tp_str}</code>")
+                            lines.append(f"   SL    : <code>{sl_str}</code>")
+                            lines.append(f"   PnL   : <code>{sign}{pnl:.2f} USDT</code> (<code>{sign}{pnl_pct:.2f}%</code>)")
+                            lines.append(f"   RR    : <code>{rr_str}</code>\n")
+                    else:
+                        lines.append("💤 Tidak ada posisi aktif.\n")
+
+                    lines.append("━━━━━━━━━━━━━━━━━━━")
+                    lines.append("🔍 <b>ANALISA AKTIF</b>")
+                    lines.append("━━━━━━━━━━━━━━━━━━━\n")
+
+                    analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
+                    if analyzing:
+                        for e in analyzing:
+                            mode_clean = "1H" if "1H" in e.mode else "4H"
+                            state_clean = e.state.replace('_', ' ')
                             
-                            opp = "SELL" if p["side"] == "BUY" else "BUY"
-                            sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], tick), "closePosition": "true"}
-                            res_sl = post_api(sl_p, "/fapi/v1/order")
+                            zone_label = getattr(e, 'active_zone', '')
+                            if zone_label: state_clean += f" ({zone_label})"
                             
-                            if "code" in res_sl:
-                                sl_p.pop("stopPrice")
-                                sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(p["ep"], tick)})
-                                post_api(sl_p, "/fapi/v1/algoOrder")
+                            pr = precisions.get(e.symbol, {})
+                            tick = pr.get("tick", 4) if pr else 4
                             
-                            rep(f"🛡️ <b>{s}</b> Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
+                            tp_str = round_v(e.tp, tick) if e.tp else "-"
+                            sl_str = round_v(e.sl, tick) if e.sl else "-"
+
+                            rr_str = "-"
+                            if e.state == "WAIT_ENTRY" and e.entry and e.tp and e.sl:
+                                risk = (e.entry - e.sl) if e.direction == "BUY" else (e.sl - e.entry)
+                                reward = (e.tp - e.entry) if e.direction == "BUY" else (e.entry - e.tp)
+                                if risk > 0:
+                                    rr = reward / risk
+                                    rr_str = f"1 : {rr:.2f}"
+
+                            lines.append(f"• <b>{e.symbol}</b> ({mode_clean})")
+                            lines.append(f"  Bias  : <code>{state_clean}</code>")
                             
-                    elif cmd == "/help":
-                        msg = "<b>📖 REMOTE CONTROL:</b>\n/setapi api_key_disini\n/setsecret secret_key_disini\n/margin 2.5\n/leverage 20\n/buffer 0.2\n/minrr 2.0\n\n<b>📊 MONITOR:</b>\n/status\n/pnl\n/close koin_atau_all\n/bep koin_atau_all"
-                        rep(msg)
-                except Exception as e:
-                    logger.error(f"Error memproses command {txt}: {e}")
+                            if e.state == "WAIT_ENTRY" and e.entry:
+                                lines.append(f"  Entry : <code>{round_v(e.entry, tick)}</code>")
+                                
+                            lines.append(f"  TP    : <code>{tp_str}</code>")
+                            lines.append(f"  SL    : <code>{sl_str}</code>")
+                            if e.state == "WAIT_ENTRY":
+                                lines.append(f"  RR    : <code>{rr_str}</code>")
+                            lines.append("")
+                    else:
+                        lines.append("💤 Semua koin sedang IDLE.\n")
+
+                    rep("\n".join(lines).strip())
+
+                elif txt.startswith("/close"):
+                    target = txt.replace("/close", "").strip().upper()
+                    if target != "ALL" and not target.endswith("USDT"): target += "USDT"
+                    to_close = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
+                    for s in to_close:
+                        p, pr = positions[s], precisions.get(s)
+                        qty_str = round_v(p["qty"], pr["step"]) if pr else str(p["qty"])
+                        side = "SELL" if p["side"] == "BUY" else "BUY"
+                        post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
+                        post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
+                        post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
+                        rep(f"🛑 {s} ditutup paksa via Market.")
+
+                elif txt.startswith("/bep"):
+                    target = txt.replace("/bep", "").strip().upper()
+                    if target != "ALL" and not target.endswith("USDT"): target += "USDT"
+                    to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
+                    for s in to_bep:
+                        p, pr = positions[s], precisions.get(s)
+                        
+                        orders = post_api({"symbol": s}, "/fapi/v1/openOrders", method="GET")
+                        if isinstance(orders, list):
+                            for o in orders:
+                                if o.get("origType", o.get("type", "")) in ["STOP_MARKET", "STOP"]:
+                                    post_api({"symbol": s, "orderId": o.get("orderId")}, "/fapi/v1/order", method="DELETE")
+
+                        algo_orders = post_api({"symbol": s}, "/fapi/v1/openAlgoOrders", method="GET")
+                        if isinstance(algo_orders, list):
+                            for o in algo_orders:
+                                if o.get("origType", o.get("type", o.get("orderType", ""))) in ["STOP_MARKET", "STOP"]:
+                                    post_api({"symbol": s, "algoId": o.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
+                        
+                        opp = "SELL" if p["side"] == "BUY" else "BUY"
+                        
+                        sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], pr["tick"]), "closePosition": "true"}
+                        res_sl = post_api(sl_p, "/fapi/v1/order")
+                        if "code" in res_sl:
+                            sl_p.pop("stopPrice")
+                            sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(p["ep"], pr["tick"])})
+                            post_api(sl_p, "/fapi/v1/algoOrder")
+                        
+                        rep(f"🛡️ <b>{s}</b> Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
+                        
+                elif txt.startswith("/help"):
+                    msg = "<b>📖 Commands:</b>\n/setapi <api>\n/setsecret <secret>\n/margin <angka>\n/leverage <angka>\n/buffer <angka>\n/minrr <angka>\n/status — Status bot\n/pnl — PnL bulan ini\n/mode <1h/4h/double> — Ubah Mode\n/close <koin/all> — Tutup Posisi\n/bep <koin/all> — SL ke Entry"
+                    rep(msg)
         except Exception as e:
-            logger.error(f"Telegram polling error: {e}")
             time.sleep(5)
 
 def load_monthly_pnl():
@@ -732,28 +755,29 @@ def on_user_msg(ws, m):
             if o["X"] == "FILLED" and o.get("o") == "LIMIT" and s in active_signals:
                 sig, pr = active_signals[s], precisions.get(s, {})
                 opp = "SELL" if sig["dir"] == "BUY" else "BUY"
-                tick = pr.get("tick", 4) if pr else 4
                 
                 for e in engines:
                     if e.symbol == s and e.pending_sl_algo_id:
                         post_api({"symbol": s, "orderId": e.pending_sl_algo_id}, "/fapi/v1/order", method="DELETE")
                         post_api({"symbol": s, "algoId": e.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
                 
-                sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(sig["sl"], tick), "closePosition": "true"}
+                sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(sig["sl"], pr["tick"]), "closePosition": "true"}
                 res_sl = post_api(sl_p, "/fapi/v1/order")
                 if "code" in res_sl:
                     sl_p.pop("stopPrice")
-                    sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["sl"], tick)})
+                    sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["sl"], pr["tick"])})
                     post_api(sl_p, "/fapi/v1/algoOrder")
 
-                tp_p = {"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], tick), "closePosition": "true"}
+                tp_p = {"symbol": s, "side": opp, "type": "TAKE_PROFIT_MARKET", "stopPrice": round_v(sig["tp"], pr["tick"]), "closePosition": "true"}
                 res_tp = post_api(tp_p, "/fapi/v1/order")
                 if "code" in res_tp:
                     tp_p.pop("stopPrice")
-                    tp_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["tp"], tick)})
+                    tp_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["tp"], pr["tick"])})
                     post_api(tp_p, "/fapi/v1/algoOrder")
                 
-                send_telegram(f"🚀 <b>{s}</b> LIMIT FILLED!\nTP: <code>{round_v(sig['tp'], tick)}</code> | SL: <code>{round_v(sig['sl'], tick)}</code>")
+                tp_str = round_v(sig['tp'], pr['tick'])
+                sl_str = round_v(sig['sl'], pr['tick'])
+                send_telegram(f"🚀 <b>{s}</b> LIMIT FILLED!\nTP: <code>{tp_str}</code> | SL: <code>{sl_str}</code> (Auto-Attached)")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
@@ -761,6 +785,7 @@ def on_user_msg(ws, m):
                 if rp > 0: total_wins += 1
                 else: total_losses += 1
                 
+                # --- [FITUR BARU] THE TRUTH TELLER ---
                 order_type = o.get("o")
                 orig_type = o.get("ot", order_type)
                 
@@ -769,8 +794,10 @@ def on_user_msg(ws, m):
                 elif order_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"] or orig_type in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"]:
                     reason = "Hit Take Profit 🎯"
                 else:
-                    if rp > 0: reason = "Hit Take Profit 🎯 (Algo Trigger)"
-                    else: reason = "Hit Stop Loss 🛑 (Wick Sweep/Jarum)"
+                    if rp > 0:
+                        reason = "Hit Take Profit 🎯 (Algo Trigger)"
+                    else:
+                        reason = "Hit Stop Loss 🛑 (Wick Sweep/Jarum)"
                 
                 mode = active_signals.get(s, {}).get("mode", "UNKNOWN")
                 log_trade(s, o["S"], rp, mode)
@@ -853,6 +880,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v8.5 (THE DIAGNOSTIC SYSTEM - HTML MODE) ACTIVE...")
+    print("🔥 BOT v8.7 (THE BULLETPROOF HYBRID) ACTIVE...")
     while True:
         time.sleep(1)
