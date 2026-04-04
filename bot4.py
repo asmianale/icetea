@@ -74,12 +74,14 @@ def send_telegram(msg):
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if token and chat_id:
             try:
-                safe_msg = msg.replace("_", " ")
                 url = f"https://api.telegram.org/bot{token}/sendMessage"
-                payload = {"chat_id": chat_id, "text": safe_msg, "parse_mode": "Markdown"}
-                requests.post(url, json=payload, timeout=10)
+                # [V8.5: PINDAH KE MODE HTML AGAR ANTI GAGAL]
+                payload = {"chat_id": chat_id, "text": msg, "parse_mode": "HTML"}
+                res = requests.post(url, json=payload, timeout=10).json()
+                if not res.get("ok"):
+                    logger.error(f"Gagal kirim ke Telegram: {res}")
             except Exception as e:
-                pass
+                logger.error(f"Koneksi Telegram Error: {e}")
     threading.Thread(target=run, daemon=True).start()
 
 precisions = {}
@@ -141,7 +143,7 @@ def post_api(params, endpoint, method="POST"):
         return {"error": str(e)}
 
 # ==============================================================================
-# LOGIKA SMC — STRICT VIRGIN FVG (ZERO TOUCH DENGAN PERLINDUNGAN LIVE CANDLE)
+# LOGIKA SMC — STRICT VIRGIN FVG 
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1): 
     if len(candles) < depth + 4: return []
@@ -150,10 +152,9 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
 
     for i in range(start_idx, len(candles) - 3):
         c0 = candles[i]
-        c1 = candles[i+1] # Candle Momentum
+        c1 = candles[i+1]
         c2 = candles[i+2]
 
-        # 🟢 BULLISH FVG
         if c0["h"] < c2["l"] and c1["c"] > c1["o"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 fvg_b, fvg_t = c0["h"], c2["l"]
@@ -167,7 +168,6 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                 if is_valid: 
                     pois.append({"dir": "BUY", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
 
-        # 🔴 BEARISH FVG
         elif c0["l"] > c2["h"] and c1["c"] < c1["o"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 fvg_t, fvg_b = c0["l"], c2["h"]
@@ -180,7 +180,6 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                         
                 if is_valid: 
                     pois.append({"dir": "SELL", "fvg_b": fvg_b, "fvg_t": fvg_t, "ob_b": ob_b, "ob_t": ob_t, "t": c0["t"]})
-
     return pois
 
 def get_target(candles, direction, depth=20):
@@ -238,7 +237,6 @@ class Engine:
                 highs = [max(x["o"], x["c"]) for x in prev_5]
                 lows = [min(x["o"], x["c"]) for x in prev_5]
                 
-                # [UNLEASHED: NO MAX RR LIMITER]
                 if self.direction == "BUY" and curr["c"] > max(highs):
                     cisd_low = min(c["l"] for c in ltf_scan[i-5:i+1])
                     if cisd_low > poi["fvg_t"] or cisd_low < poi["ob_b"]: continue
@@ -305,7 +303,7 @@ class Engine:
                 self.reset(); return
 
         if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
-            send_telegram(f"⏳ *{self.symbol}* [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
+            send_telegram(f"⏳ <b>{self.symbol}</b> [{self.mode}] Batal: Jaring Limit kadaluarsa.")
             self.cancel_pending_orders()
             if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
             self.reset()
@@ -389,10 +387,8 @@ class Engine:
                     self.ignored_pois.append(self.active_poi["t"])
                     self.reset() 
                 
-        # --- [THE WICK HUNTER] ---
         elif self.state == "WAIT_ENTRY":
             last_k = c_t[-1] if len(c_t) > 0 else None
-            
             if self.direction == "BUY":
                 if price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)):
                     self.cancel_pending_orders()
@@ -436,16 +432,16 @@ class Engine:
                     }
                     sl_res = post_api(sl_params, "/fapi/v1/algoOrder")
                     
-                    if "code" in sl_res: send_telegram(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
+                    if "code" in sl_res: logger.error(f"⚠️ ERROR BINANCE (SL {self.symbol}): {sl_res.get('msg')}")
                     else: self.pending_sl_algo_id = sl_res.get("algoId") or sl_res.get("orderId")
                     
                     ep_str = round_v(self.entry, p["tick"])
                     sl_str = round_v(self.sl, p["tick"])
                     tp_str = round_v(self.tp, p["tick"])
-                    msg = f"⏳ *{self.symbol}* LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: `{ep_str}`\n🛑 SL: `{sl_str}`\n🎯 TP: `{tp_str}`"
+                    msg = f"⏳ <b>{self.symbol}</b> LIMIT + SL ({self.mode})\n📍 Dir: {self.direction}\n💰 Entry: <code>{ep_str}</code>\n🛑 SL: <code>{sl_str}</code>\n🎯 TP: <code>{tp_str}</code>"
                     send_telegram(msg)
                 else: 
-                    send_telegram(f"⚠️ ERROR BINANCE (LIMIT {self.symbol}): {res.get('msg')}")
+                    logger.error(f"⚠️ ERROR BINANCE (LIMIT {self.symbol}): {res.get('msg')}")
                     with state_lock: active_signals.pop(self.symbol, None)
                     self.reset()
             except Exception as e:
@@ -459,14 +455,16 @@ class Engine:
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
-# 📱 TELEGRAM CMD & UTILS (V8.4 - THE BULLETPROOF CONTROLLER)
+# 📱 TELEGRAM CMD (V8.5 - HTML + LOGGING TERMINAL)
 # ==============================================================================
 def telegram_cmd():
     global total_pnl, total_wins, total_losses, current_month_str
     global API_KEY, SECRET_KEY, MARGIN_USDT, LEVERAGE, SL_BUFFER_PCT, MIN_RR
     
     t = os.getenv("TELEGRAM_TOKEN")
-    if not t: return
+    if not t: 
+        logger.error("🚨 TELEGRAM_TOKEN TIDAK DITEMUKAN DI .env!")
+        return
         
     lid = 0
     while True:
@@ -476,79 +474,69 @@ def telegram_cmd():
             
             for i in r.get("result", []):
                 lid = i["update_id"] + 1
-                txt = i.get("message", {}).get("text", "")
-                if not txt: continue
-                txt = txt.strip().lower()
+                msg_obj = i.get("message", {})
+                txt = msg_obj.get("text", "")
                 
+                if not txt: continue
+                logger.info(f"📥 Pesan Telegram diterima: {txt}") # LOG KE TERMINAL
+                
+                txt_lower = txt.strip().lower()
                 def rep(msg): send_telegram(msg)
 
                 try:
-                    # --- REMOTE CONTROL CONFIG ---
-                    if txt.startswith("/setapi"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            API_KEY = parts[1]
-                            update_env_file("BINANCE_API_KEY", API_KEY)
-                            rep("✅ API KEY Berhasil diperbarui!")
-                            
-                    elif txt.startswith("/setsecret"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            SECRET_KEY = parts[1]
-                            update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
-                            rep("✅ SECRET KEY Berhasil diperbarui!")
-                            
-                    elif txt.startswith("/margin"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            MARGIN_USDT = float(parts[1])
-                            update_env_file("MARGIN_USDT", MARGIN_USDT)
-                            rep(f"✅ Margin diubah ke: {MARGIN_USDT} USDT")
-                            
-                    elif txt.startswith("/leverage"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            LEVERAGE = int(parts[1])
-                            update_env_file("LEVERAGE", LEVERAGE)
-                            rep(f"✅ Leverage diubah ke: {LEVERAGE}x")
-                            
-                    elif txt.startswith("/buffer"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            SL_BUFFER_PCT = float(parts[1])
-                            update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
-                            rep(f"✅ SL Buffer diubah ke: {SL_BUFFER_PCT}%")
-                            
-                    elif txt.startswith("/minrr"):
-                        parts = txt.split()
-                        if len(parts) > 1:
-                            MIN_RR = float(parts[1])
-                            update_env_file("MIN_RR", MIN_RR)
-                            rep(f"✅ Min RR diubah ke: {MIN_RR}")
+                    parts = txt_lower.split()
+                    cmd = parts[0]
 
-                    # --- MONITORING & ACTION ---
-                    elif txt.startswith("/pnl"):
+                    if cmd == "/setapi" and len(parts) > 1:
+                        API_KEY = parts[1]
+                        update_env_file("BINANCE_API_KEY", API_KEY)
+                        rep("✅ API KEY Berhasil diperbarui!")
+                        
+                    elif cmd == "/setsecret" and len(parts) > 1:
+                        SECRET_KEY = parts[1]
+                        update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
+                        rep("✅ SECRET KEY Berhasil diperbarui!")
+                        
+                    elif cmd == "/margin" and len(parts) > 1:
+                        MARGIN_USDT = float(parts[1])
+                        update_env_file("MARGIN_USDT", MARGIN_USDT)
+                        rep(f"✅ Margin diubah ke: <b>{MARGIN_USDT} USDT</b>")
+                        
+                    elif cmd == "/leverage" and len(parts) > 1:
+                        LEVERAGE = int(parts[1])
+                        update_env_file("LEVERAGE", LEVERAGE)
+                        rep(f"✅ Leverage diubah ke: <b>{LEVERAGE}x</b>")
+                        
+                    elif cmd == "/buffer" and len(parts) > 1:
+                        SL_BUFFER_PCT = float(parts[1])
+                        update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
+                        rep(f"✅ SL Buffer diubah ke: <b>{SL_BUFFER_PCT}%</b>")
+                        
+                    elif cmd == "/minrr" and len(parts) > 1:
+                        MIN_RR = float(parts[1])
+                        update_env_file("MIN_RR", MIN_RR)
+                        rep(f"✅ Min RR diubah ke: <b>{MIN_RR}</b>")
+
+                    elif cmd == "/pnl":
                         total_trades = total_wins + total_losses
                         wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
                         mode_str = "DOUBLE (1H & 4H)" if config["ENABLE_1H"] and config["ENABLE_4H"] else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
-                        msg = f"📊 *PnL {current_month_str}*\n💰 Total: `{total_pnl:.4f} USDT`\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
+                        msg = f"📊 <b>PnL {current_month_str}</b>\n💰 Total: <code>{total_pnl:.4f} USDT</code>\n📈 Winrate: {wr:.1f}%\n✅ Wins: {total_wins} | ❌ Loss: {total_losses}\n⚙️ Mode: {mode_str}"
                         rep(msg)
                     
-                    elif txt in ["/mode 1h", "/mode 4h", "/mode double"]:
-                        config["ENABLE_1H"] = txt in ["/mode 1h", "/mode double"]
-                        config["ENABLE_4H"] = txt in ["/mode 4h", "/mode double"]
+                    elif cmd in ["/mode 1h", "/mode 4h", "/mode double"]:
+                        config["ENABLE_1H"] = cmd in ["/mode 1h", "/mode double"]
+                        config["ENABLE_4H"] = cmd in ["/mode 4h", "/mode double"]
                         for e in engines: e.cancel_pending_orders(); e.reset()
-                        rep(f"✅ Mode diubah ke: {txt.upper()}")
+                        rep(f"✅ Mode diubah ke: <b>{cmd.upper()}</b>")
 
-                    elif txt.startswith("/status"):
-                        lines = ["📊 *STATUS BOT V8.4*\n"]
-                        
-                        lines.append("⚙️ *CONFIG AKTIF*")
-                        lines.append(f"   Margin: `{MARGIN_USDT}` | Lev: `{LEVERAGE}x`")
-                        lines.append(f"   Buffer: `{SL_BUFFER_PCT}%` | MinRR: `{MIN_RR}`\n")
-                        
+                    elif cmd == "/status":
+                        lines = ["📊 <b>STATUS BOT V8.5</b>\n"]
+                        lines.append("⚙️ <b>CONFIG AKTIF</b>")
+                        lines.append(f"   Margin: <code>{MARGIN_USDT}</code> | Lev: <code>{LEVERAGE}x</code>")
+                        lines.append(f"   Buffer: <code>{SL_BUFFER_PCT}%</code> | MinRR: <code>{MIN_RR}</code>\n")
                         lines.append("━━━━━━━━━━━━━━━━━━━")
-                        lines.append("📈 *POSISI FLOATING*")
+                        lines.append("📈 <b>POSISI FLOATING</b>")
                         lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
                         if positions:
@@ -590,21 +578,19 @@ def telegram_cmd():
                                     ep = p['ep']
                                     risk = (ep - sl_val) if p['side'] == "BUY" else (sl_val - ep)
                                     reward = (tp_val - ep) if p['side'] == "BUY" else (ep - tp_val)
-                                    if risk > 0:
-                                        rr = reward / risk
-                                        rr_str = f"1 : {rr:.2f}"
+                                    if risk > 0: rr_str = f"1 : {reward / risk:.2f}"
 
-                                lines.append(f"{emo} *{s}* ({p['side']})")
-                                lines.append(f"   Entry : `{p['ep']}`")
-                                lines.append(f"   TP    : `{tp_str}`")
-                                lines.append(f"   SL    : `{sl_str}`")
-                                lines.append(f"   PnL   : `{sign}{pnl:.2f} USDT` (`{sign}{pnl_pct:.2f}%`)")
-                                lines.append(f"   RR    : `{rr_str}`\n")
+                                lines.append(f"{emo} <b>{s}</b> ({p['side']})")
+                                lines.append(f"   Entry : <code>{p['ep']}</code>")
+                                lines.append(f"   TP    : <code>{tp_str}</code>")
+                                lines.append(f"   SL    : <code>{sl_str}</code>")
+                                lines.append(f"   PnL   : <code>{sign}{pnl:.2f} USDT</code> (<code>{sign}{pnl_pct:.2f}%</code>)")
+                                lines.append(f"   RR    : <code>{rr_str}</code>\n")
                         else:
                             lines.append("💤 Tidak ada posisi aktif.\n")
 
                         lines.append("━━━━━━━━━━━━━━━━━━━")
-                        lines.append("🔍 *ANALISA AKTIF*")
+                        lines.append("🔍 <b>ANALISA AKTIF</b>")
                         lines.append("━━━━━━━━━━━━━━━━━━━\n")
 
                         analyzing = [e for e in engines if e.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_ENTRY", "WAIT_OB_TOUCH"]]
@@ -612,63 +598,44 @@ def telegram_cmd():
                             for e in analyzing:
                                 mode_clean = "1H" if "1H" in e.mode else "4H"
                                 state_clean = e.state.replace('_', ' ')
-                                
                                 zone_label = getattr(e, 'active_zone', '')
                                 if zone_label: state_clean += f" ({zone_label})"
                                 
                                 pr = precisions.get(e.symbol, {})
                                 tick = pr.get("tick", 4) if pr else 4
-                                
                                 tp_str = round_v(e.tp, tick) if e.tp else "-"
                                 sl_str = round_v(e.sl, tick) if e.sl else "-"
 
-                                rr_str = "-"
-                                if e.state == "WAIT_ENTRY" and e.entry and e.tp and e.sl:
-                                    risk = (e.entry - e.sl) if e.direction == "BUY" else (e.sl - e.entry)
-                                    reward = (e.tp - e.entry) if e.direction == "BUY" else (e.entry - e.tp)
-                                    if risk > 0:
-                                        rr = reward / risk
-                                        rr_str = f"1 : {rr:.2f}"
-
-                                lines.append(f"• *{e.symbol}* ({mode_clean})")
-                                lines.append(f"  Bias  : `{state_clean}`")
-                                
+                                lines.append(f"• <b>{e.symbol}</b> ({mode_clean})")
+                                lines.append(f"  Bias  : <code>{state_clean}</code>")
                                 if e.state == "WAIT_ENTRY" and e.entry:
-                                    lines.append(f"  Entry : `{round_v(e.entry, tick)}`")
-                                    
-                                lines.append(f"  TP    : `{tp_str}`")
-                                lines.append(f"  SL    : `{sl_str}`")
-                                if e.state == "WAIT_ENTRY":
-                                    lines.append(f"  RR    : `{rr_str}`")
-                                lines.append("")
+                                    lines.append(f"  Entry : <code>{round_v(e.entry, tick)}</code>")
+                                lines.append(f"  TP    : <code>{tp_str}</code>")
+                                lines.append(f"  SL    : <code>{sl_str}</code>\n")
                         else:
                             lines.append("💤 Semua koin sedang IDLE.\n")
 
                         rep("\n".join(lines).strip())
 
-                    elif txt.startswith("/close"):
-                        target = txt.replace("/close", "").strip().upper()
-                        if target != "ALL" and not target.endswith("USDT") and target != "": target += "USDT"
-                        if target == "": target = "ALL"
+                    elif cmd == "/close":
+                        target = parts[1].upper() if len(parts) > 1 else "ALL"
+                        if target != "ALL" and not target.endswith("USDT"): target += "USDT"
                         
                         to_close = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
                         for s in to_close:
                             p = positions[s]
                             pr = precisions.get(s)
-                            
-                            # Cek jika pr gagal load (safety fallback)
                             qty_str = round_v(p["qty"], pr["step"]) if pr else str(p["qty"])
                             side = "SELL" if p["side"] == "BUY" else "BUY"
                             
                             post_api({"symbol": s, "side": side, "type": "MARKET", "quantity": qty_str, "reduceOnly": "true"}, "/fapi/v1/order")
                             post_api({"symbol": s}, "/fapi/v1/allOpenOrders", method="DELETE")
                             post_api({"symbol": s}, "/fapi/v1/algoOpenOrders", method="DELETE")
-                            rep(f"🛑 {s} ditutup paksa via Market.")
+                            rep(f"🛑 <b>{s}</b> ditutup paksa via Market.")
 
-                    elif txt.startswith("/bep"):
-                        target = txt.replace("/bep", "").strip().upper()
-                        if target != "ALL" and not target.endswith("USDT") and target != "": target += "USDT"
-                        if target == "": target = "ALL"
+                    elif cmd == "/bep":
+                        target = parts[1].upper() if len(parts) > 1 else "ALL"
+                        if target != "ALL" and not target.endswith("USDT"): target += "USDT"
                         
                         to_bep = [s for s in positions] if target == "ALL" else ([target] if target in positions else [])
                         for s in to_bep:
@@ -689,22 +656,23 @@ def telegram_cmd():
                                         post_api({"symbol": s, "algoId": o.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
                             
                             opp = "SELL" if p["side"] == "BUY" else "BUY"
-                            
                             sl_p = {"symbol": s, "side": opp, "type": "STOP_MARKET", "stopPrice": round_v(p["ep"], tick), "closePosition": "true"}
                             res_sl = post_api(sl_p, "/fapi/v1/order")
+                            
                             if "code" in res_sl:
                                 sl_p.pop("stopPrice")
                                 sl_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(p["ep"], tick)})
                                 post_api(sl_p, "/fapi/v1/algoOrder")
                             
-                            rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
+                            rep(f"🛡️ <b>{s}</b> Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                             
-                    elif txt.startswith("/help"):
-                        msg = "*📖 REMOTE CONTROL:*\n/setapi <api>\n/setsecret <secret>\n/margin <angka>\n/leverage <angka>\n/buffer <angka>\n/minrr <angka>\n\n*📊 MONITOR:*\n/status\n/pnl\n/close <koin/all>\n/bep <koin/all>"
+                    elif cmd == "/help":
+                        msg = "<b>📖 REMOTE CONTROL:</b>\n/setapi api_key_disini\n/setsecret secret_key_disini\n/margin 2.5\n/leverage 20\n/buffer 0.2\n/minrr 2.0\n\n<b>📊 MONITOR:</b>\n/status\n/pnl\n/close koin_atau_all\n/bep koin_atau_all"
                         rep(msg)
                 except Exception as e:
-                    rep(f"⚠️ Eksekusi Perintah Gagal: {e}")
+                    logger.error(f"Error memproses command {txt}: {e}")
         except Exception as e:
+            logger.error(f"Telegram polling error: {e}")
             time.sleep(5)
 
 def load_monthly_pnl():
@@ -738,7 +706,7 @@ def keep_alive_listenkey():
             pass
 
 # ==============================================================================
-# WS HANDLER & STARTUP (THE TRUTH TELLER LOGIC)
+# WS HANDLER & STARTUP
 # ==============================================================================
 def on_market_msg(ws, m):
     try:
@@ -785,7 +753,7 @@ def on_user_msg(ws, m):
                     tp_p.update({"algoType": "CONDITIONAL", "triggerPrice": round_v(sig["tp"], tick)})
                     post_api(tp_p, "/fapi/v1/algoOrder")
                 
-                send_telegram(f"🚀 *{s}* LIMIT FILLED!\nTP: `{round_v(sig['tp'], tick)}` | SL: `{round_v(sig['sl'], tick)}` (Auto-Attached)")
+                send_telegram(f"🚀 <b>{s}</b> LIMIT FILLED!\nTP: <code>{round_v(sig['tp'], tick)}</code> | SL: <code>{round_v(sig['sl'], tick)}</code>")
 
             if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"])
@@ -807,7 +775,7 @@ def on_user_msg(ws, m):
                 mode = active_signals.get(s, {}).get("mode", "UNKNOWN")
                 log_trade(s, o["S"], rp, mode)
                 emo = "✅" if rp > 0 else "❌"
-                send_telegram(f"{emo} *{s}* CLOSED!\nReason: {reason}\nPnL: `{rp:+.4f} USDT`")
+                send_telegram(f"{emo} <b>{s}</b> CLOSED!\nReason: {reason}\nPnL: <code>{rp:+.4f} USDT</code>")
 
         if d.get("e") == "ACCOUNT_UPDATE":
             for p in d["a"]["P"]:
@@ -885,6 +853,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v8.4 (THE BULLETPROOF SYSTEM) ACTIVE...")
+    print("🔥 BOT v8.5 (THE DIAGNOSTIC SYSTEM - HTML MODE) ACTIVE...")
     while True:
         time.sleep(1)
