@@ -35,7 +35,7 @@ total_losses = 0
 current_month_str = datetime.now().strftime("%Y-%m")
 state_lock = threading.Lock()
 
-# --- [FITUR BARU] ENV UPDATER ---
+# --- [INJEKSI 1] ENV UPDATER ---
 def update_env_file(key, value):
     env_path = ".env"
     lines = []
@@ -77,9 +77,12 @@ def send_telegram(msg):
                 safe_msg = msg.replace("_", " ")
                 url = f"https://api.telegram.org/bot{token}/sendMessage"
                 payload = {"chat_id": chat_id, "text": safe_msg, "parse_mode": "Markdown"}
-                requests.post(url, json=payload, timeout=10)
+                res = requests.post(url, json=payload, timeout=10)
+                # [INJEKSI 2] Terminal Logger Anti-Buta
+                if res.status_code != 200:
+                    print(f"\n[TELEGRAM ERROR] Telegram menolak pesan! Alasan: {res.text}\n")
             except Exception as e:
-                pass
+                print(f"\n[TELEGRAM ERROR KONEKSI] {e}\n")
     threading.Thread(target=run, daemon=True).start()
 
 precisions = {}
@@ -160,7 +163,9 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                 ob_b, ob_t = c0["l"], c0["h"] 
                 
                 is_valid = True
+                # Abaikan live candle terakhir (-1) agar tidak batal saat di-tap hari ini
                 for j in range(i+3, len(candles) - 1):
+                    # Batal jika harga menembus atap FVG walau 1 tick di masa lalu
                     if candles[j]["l"] <= fvg_t: 
                         is_valid = False; break 
                         
@@ -174,7 +179,9 @@ def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
                 ob_b, ob_t = c0["l"], c0["h"] 
                 
                 is_valid = True
+                # Abaikan live candle terakhir (-1) agar tidak batal saat di-tap hari ini
                 for j in range(i+3, len(candles) - 1):
+                    # Batal jika harga menembus lantai FVG walau 1 tick di masa lalu
                     if candles[j]["h"] >= fvg_b: 
                         is_valid = False; break 
                         
@@ -296,11 +303,13 @@ class Engine:
         if not c_p or price == 0: return
         if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
             
+        # TIMEOUT FASE ANALISA (1 JAM)
         if self.setup_time and time.time() - self.setup_time > 3600:
             if self.state in ["WAIT_C1", "WAIT_C2", "WAIT_C3", "WAIT_OB_TOUCH"]:
                 if self.active_poi: self.ignored_pois.append(self.active_poi["t"])
                 self.reset(); return
 
+        # TIMEOUT JARING LIMIT (2 JAM)
         if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
             send_telegram(f"⏳ *{self.symbol}* [{self.mode}] Batal: Jaring Limit kadaluarsa (2 Jam tidak dijemput).")
             self.cancel_pending_orders()
@@ -387,16 +396,21 @@ class Engine:
                     self.reset() 
                 
         elif self.state == "WAIT_ENTRY":
-            # --- [FITUR BARU] THE WICK HUNTER ---
+            # --- [INJEKSI 3] THE WICK HUNTER (Anti Tertinggal Kereta) ---
             last_k = c_t[-1] if len(c_t) > 0 else None
-            hit_tp_sl_buy = self.direction == "BUY" and (price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)))
-            hit_tp_sl_sell = self.direction == "SELL" and (price <= self.tp or price >= self.sl or (last_k and (last_k["l"] <= self.tp or last_k["h"] >= self.sl)))
             
-            if hit_tp_sl_buy or hit_tp_sl_sell:
-                send_telegram(f"❌ *{self.symbol}* [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
-                self.cancel_pending_orders()
-                self.ignored_pois.append(self.active_poi["t"])
-                self.reset()
+            if self.direction == "BUY":
+                if price >= self.tp or price <= self.sl or (last_k and (last_k["h"] >= self.tp or last_k["l"] <= self.sl)):
+                    send_telegram(f"❌ *{self.symbol}* [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
+                    self.cancel_pending_orders()
+                    self.ignored_pois.append(self.active_poi["t"])
+                    self.reset()
+            elif self.direction == "SELL":
+                if price <= self.tp or price >= self.sl or (last_k and (last_k["l"] <= self.tp or last_k["h"] >= self.sl)):
+                    send_telegram(f"❌ *{self.symbol}* [{self.mode}] Batal: Harga lari ke TP/SL duluan (Tertinggal kereta).")
+                    self.cancel_pending_orders()
+                    self.ignored_pois.append(self.active_poi["t"])
+                    self.reset()
 
     def place_limit_and_sl(self):
         def run():
@@ -453,9 +467,10 @@ class Engine:
         threading.Thread(target=run, daemon=True).start()
 
 # ==============================================================================
-# 📱 TELEGRAM CMD & UTILS (V7.7 BASE + REMOTE CONTROL)
+# 📱 TELEGRAM CMD & UTILS
 # ==============================================================================
 def telegram_cmd():
+    # [INJEKSI 4] Mendeklarasikan global agar update env berfungsi
     global total_pnl, total_wins, total_losses, current_month_str
     global API_KEY, SECRET_KEY, MARGIN_USDT, LEVERAGE, SL_BUFFER_PCT, MIN_RR
     
@@ -472,56 +487,47 @@ def telegram_cmd():
                 lid = i["update_id"] + 1
                 txt = i.get("message", {}).get("text", "")
                 if not txt: continue
-                
-                # [FITUR BARU] Tampilkan di terminal saat bot dengar pesan
-                logger.info(f"📥 Pesan Telegram Diterima: {txt}")
-                
                 txt = txt.strip().lower()
                 def rep(msg): send_telegram(msg)
 
-                parts = txt.split()
-                cmd = parts[0]
+                # --- [INJEKSI 5] REMOTE CONTROL MENGGUNAKAN GAYA V7.7 ---
+                if txt.startswith("/margin"):
+                    val = txt.replace("/margin", "").strip()
+                    if val:
+                        try:
+                            MARGIN_USDT = float(val)
+                            update_env_file("MARGIN_USDT", MARGIN_USDT)
+                            rep(f"✅ Margin diubah ke: {MARGIN_USDT} USDT")
+                        except Exception: pass
 
-                # --- [FITUR BARU] REMOTE CONTROL ---
-                if cmd == "/setapi" and len(parts) > 1:
-                    API_KEY = parts[1]
-                    update_env_file("BINANCE_API_KEY", API_KEY)
-                    rep("✅ API KEY Berhasil diperbarui!")
-                    
-                elif cmd == "/setsecret" and len(parts) > 1:
-                    SECRET_KEY = parts[1]
-                    update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
-                    rep("✅ SECRET KEY Berhasil diperbarui!")
-                    
-                elif cmd == "/margin" and len(parts) > 1:
-                    try:
-                        MARGIN_USDT = float(parts[1])
-                        update_env_file("MARGIN_USDT", MARGIN_USDT)
-                        rep(f"✅ Margin diubah ke: *{MARGIN_USDT} USDT*")
-                    except: rep("⚠️ Format angka salah.")
-                        
-                elif cmd == "/leverage" and len(parts) > 1:
-                    try:
-                        LEVERAGE = int(parts[1])
-                        update_env_file("LEVERAGE", LEVERAGE)
-                        rep(f"✅ Leverage diubah ke: *{LEVERAGE}x*")
-                    except: rep("⚠️ Format angka salah.")
-                        
-                elif cmd == "/buffer" and len(parts) > 1:
-                    try:
-                        SL_BUFFER_PCT = float(parts[1])
-                        update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
-                        rep(f"✅ SL Buffer diubah ke: *{SL_BUFFER_PCT}%*")
-                    except: rep("⚠️ Format angka salah.")
-                        
-                elif cmd == "/minrr" and len(parts) > 1:
-                    try:
-                        MIN_RR = float(parts[1])
-                        update_env_file("MIN_RR", MIN_RR)
-                        rep(f"✅ Min RR diubah ke: *{MIN_RR}*")
-                    except: rep("⚠️ Format angka salah.")
+                elif txt.startswith("/leverage"):
+                    val = txt.replace("/leverage", "").strip()
+                    if val:
+                        try:
+                            LEVERAGE = int(val)
+                            update_env_file("LEVERAGE", LEVERAGE)
+                            rep(f"✅ Leverage diubah ke: {LEVERAGE}x")
+                        except Exception: pass
 
-                # --- COMMANDS BAWAAN V7.7 ---
+                elif txt.startswith("/buffer"):
+                    val = txt.replace("/buffer", "").strip()
+                    if val:
+                        try:
+                            SL_BUFFER_PCT = float(val)
+                            update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT)
+                            rep(f"✅ SL Buffer diubah ke: {SL_BUFFER_PCT}%")
+                        except Exception: pass
+
+                elif txt.startswith("/minrr"):
+                    val = txt.replace("/minrr", "").strip()
+                    if val:
+                        try:
+                            MIN_RR = float(val)
+                            update_env_file("MIN_RR", MIN_RR)
+                            rep(f"✅ Min RR diubah ke: {MIN_RR}")
+                        except Exception: pass
+
+                # --- V7.7 ORIGINAL COMMANDS BAWAH SINI ---
                 elif txt.startswith("/pnl"):
                     total_trades = total_wins + total_losses
                     wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
@@ -537,11 +543,8 @@ def telegram_cmd():
 
                 elif txt.startswith("/status"):
                     lines = ["📊 *STATUS BOT*\n"]
-                    
-                    lines.append("⚙️ *CONFIG AKTIF*")
-                    lines.append(f"   Margin: `{MARGIN_USDT}` | Lev: `{LEVERAGE}x`")
-                    lines.append(f"   Buffer: `{SL_BUFFER_PCT}%` | MinRR: `{MIN_RR}`\n")
-                    
+                    # Tambahan kecil untuk tampilkan config aktif
+                    lines.append(f"⚙️ Modal: {MARGIN_USDT} USDT | Lev: {LEVERAGE}x | Buffer: {SL_BUFFER_PCT}%")
                     lines.append("━━━━━━━━━━━━━━━━━━━")
                     lines.append("📈 *POSISI FLOATING*")
                     lines.append("━━━━━━━━━━━━━━━━━━━\n")
@@ -685,7 +688,7 @@ def telegram_cmd():
                         rep(f"🛡️ {s} Stop Loss dipindah ke Entry (BEP) | TP Tetap Aman.")
                         
                 elif txt.startswith("/help"):
-                    msg = "*📖 COMMANDS:*\n`/setapi <api>`\n`/setsecret <secret>`\n`/margin <angka>`\n`/leverage <angka>`\n`/buffer <angka>`\n`/minrr <angka>`\n`/status` — Status bot\n`/pnl` — PnL bulan ini\n`/mode 1h/4h/double` — Ubah Mode\n`/close koin/all` — Tutup Posisi\n`/bep koin/all` — SL ke Entry"
+                    msg = "*📖 Commands:*\n/status — Status bot\n/pnl — PnL bulan ini\n/mode <1h/4h/double> — Ubah Mode\n/close <koin/all> — Tutup Posisi\n/bep <koin/all> — SL ke Entry\n\n*🎛️ Remote Control:*\n/margin <angka>\n/leverage <angka>\n/buffer <angka>\n/minrr <angka>"
                     rep(msg)
         except Exception as e:
             time.sleep(5)
@@ -777,7 +780,7 @@ def on_user_msg(ws, m):
                 if rp > 0: total_wins += 1
                 else: total_losses += 1
                 
-                # --- [FITUR BARU] THE TRUTH TELLER ---
+                # --- [INJEKSI 6] THE TRUTH TELLER (Notif Jujur) ---
                 order_type = o.get("o")
                 orig_type = o.get("ot", order_type)
                 
@@ -870,6 +873,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v8.8 (THE V7.7 MASTERPIECE) ACTIVE...")
+    print("🔥 BOT v8.9 (THE PURE V7.7 HYBRID) ACTIVE...")
     while True:
         time.sleep(1)
