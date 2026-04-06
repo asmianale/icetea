@@ -22,13 +22,13 @@ SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT",  0.05))
 
 symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT", "SUIUSDT", "AVAXUSDT", "BNBUSDT", "TRXUSDT"]
 
-MAX_CANDLES  = 80
-MAX_IGNORED  = 100
-SWEEP_LOOKBACK  = 40   # Cari sweep max 40 candle ke belakang
-SWING_LOOKBACK  = 30   # Cari swing sebelum sweep max 30 candle
-BOS_STALE_LIMIT = 8    # BOS lebih dari 8 candle lalu dianggap basi
-MIN_BODY_PCT    = 0.02  # Body BOS minimal 0.02% agar ada momentum
-WICK_RATIO      = 1.5   # Wick sweep minimal 1.5x body
+MAX_CANDLES     = 80
+MAX_IGNORED     = 100
+SWEEP_LOOKBACK  = 40
+SWING_LOOKBACK  = 30
+BOS_STALE_LIMIT = 8
+MIN_BODY_PCT    = 0.02
+WICK_RATIO      = 1.5
 
 # --- GLOBAL STATE ---
 klines_data = {s: {tf: deque(maxlen=MAX_CANDLES) for tf in ["1m","5m","15m","1h","4h"]} for s in symbols}
@@ -136,9 +136,9 @@ def post_api(params, endpoint, method="POST"):
     pl  = f"{qs}&signature={sig}"
     url = f"{BASE_URL}{endpoint}"
     try:
-        if method == "POST":   r = requests.post(url, headers=hdr, data=pl, timeout=10)
+        if method == "POST":     r = requests.post(url, headers=hdr, data=pl, timeout=10)
         elif method == "DELETE": r = requests.delete(f"{url}?{pl}", headers=hdr, timeout=10)
-        elif method == "GET":  r = requests.get(f"{url}?{pl}", headers=hdr, timeout=10)
+        elif method == "GET":    r = requests.get(f"{url}?{pl}", headers=hdr, timeout=10)
         else: return {"error": "Unknown method"}
         return r.json()
     except Exception as e:
@@ -148,25 +148,58 @@ def post_api(params, endpoint, method="POST"):
 # SMC HELPERS
 # ==============================================================================
 def get_unmitigated_poi(candles, depth=20, min_size_pct=0.1):
+    """
+    Scan candle untuk menemukan FVG + OB yang masih virgin (belum termitigasi).
+
+    [V9.4 FIX — ROOT CAUSE SEBENARNYA]
+    FVG terbentuk dari 3 candle: c0, c1, c2.
+    Loop scan sebelumnya berhenti di len(candles) - 3, artinya:
+      - i_max = len - 4
+      - c2_max = candles[len-4+2] = candles[len-2]
+      - candles[-1] (candle paling baru) TIDAK PERNAH BISA JADI c2
+
+    Akibatnya: FVG yang baru saja terbentuk dari 3 candle terakhir
+    tidak akan pernah terdeteksi. Saat candle ke-4 langsung masuk ke
+    FVG tersebut, bot tetap IDLE karena FVG-nya tidak ada di list POI.
+
+    Fix: ubah batas loop dari len-3 → len-2, sehingga candles[-1]
+    bisa menjadi c2 dan FVG fresh langsung terdeteksi.
+
+    Cek mitigasi tetap sampai len-1 (normal) karena ini berbeda masalah.
+    """
     if len(candles) < depth + 4: return []
-    pois = []
+    pois  = []
     start = max(0, len(candles) - depth)
-    for i in range(start, len(candles) - 3):
+
+    # [V9.4 FIX] len(candles) - 2 agar candles[-1] bisa jadi c2
+    for i in range(start, len(candles) - 2):
+        if i + 2 >= len(candles): break
         c0, c1, c2 = candles[i], candles[i+1], candles[i+2]
+
+        # ── FVG Bullish ──
         if c0["h"] < c2["l"] and c1["c"] > c1["o"]:
             if (c2["l"] - c0["h"]) / c0["h"] * 100 >= min_size_pct:
                 fvg_b, fvg_t = c0["h"], c2["l"]
-                valid = all(candles[j]["l"] > fvg_t for j in range(i+3, len(candles)-1))
-                if valid:
+                is_valid = True
+                for j in range(i+3, len(candles) - 1):
+                    if candles[j]["l"] <= fvg_t:
+                        is_valid = False; break
+                if is_valid:
                     pois.append({"dir":"BUY","fvg_b":fvg_b,"fvg_t":fvg_t,
                                  "ob_b":c0["l"],"ob_t":c0["h"],"t":c0["t"]})
+
+        # ── FVG Bearish ──
         elif c0["l"] > c2["h"] and c1["c"] < c1["o"]:
             if (c0["l"] - c2["h"]) / c2["h"] * 100 >= min_size_pct:
                 fvg_t, fvg_b = c0["l"], c2["h"]
-                valid = all(candles[j]["h"] < fvg_b for j in range(i+3, len(candles)-1))
-                if valid:
+                is_valid = True
+                for j in range(i+3, len(candles) - 1):
+                    if candles[j]["h"] >= fvg_b:
+                        is_valid = False; break
+                if is_valid:
                     pois.append({"dir":"SELL","fvg_b":fvg_b,"fvg_t":fvg_t,
                                  "ob_b":c0["l"],"ob_t":c0["h"],"t":c0["t"]})
+
     return pois
 
 def get_target(candles, direction, depth=20):
@@ -182,7 +215,7 @@ def get_target(candles, direction, depth=20):
         return lows[-1] if lows else None
 
 # ==============================================================================
-# ENGINE (V9.3 — SMC LOGIC FIXED)
+# ENGINE (V9.4)
 # ==============================================================================
 class Engine:
     def __init__(self, symbol, mode):
@@ -212,7 +245,6 @@ class Engine:
         self.last_processed_conf_t = 0
 
     def safe_reset_from_outside(self):
-        """Dipanggil dari thread luar — acquire self.lock sendiri."""
         with self.lock:
             if self.active_poi:
                 self._append_ignored(self.active_poi["t"])
@@ -223,225 +255,117 @@ class Engine:
         self.ignored_pois = self.ignored_pois[-MAX_IGNORED:]
 
     # ==========================================================================
-    # CHECK & TRIGGER — SMC V9.3 (FIXED)
+    # CHECK & TRIGGER — SMC V9.3 LOGIC (tidak berubah dari v9.3)
     # ==========================================================================
     def check_and_trigger(self, log_prefix, c_trig, c_conf, scan_depth):
-        """
-        Alur SMC yang benar:
-        1. Sweep / Liquidity Grab  → candle dengan wick panjang MASUK ke zona POI
-        2. Swing High/Low terkini  → level struktur SEBELUM sweep (target BOS)
-        3. BOS / ChoCh             → candle bullish/bearish yang CLOSE tembus swing
-        4. LTF FVG / OB            → dicari MUNDUR dari BOS ke sweep (paling fresh)
-        5. Entry / SL / TP         → kalkulasi RR
-        """
         ltf = c_trig[-MAX_CANDLES:]
         n   = len(ltf)
         if n < 15: return False
         poi = self.active_poi
 
-        # ------------------------------------------------------------------
-        # ████  BUY  ████
-        # ------------------------------------------------------------------
+        # ── BUY ──
         if self.direction == "BUY":
-
-            # ── STEP 1: Sweep ──────────────────────────────────────────────
-            # Cari candle yang low-nya masuk zona POI (ob_b ≤ low ≤ fvg_t)
-            # dengan wick bawah ≥ WICK_RATIO × body → tanda rejection kuat.
-            # Dicari dari candle terbaru ke belakang (SWEEP_LOOKBACK candle).
             sweep_idx, sweep_c = None, None
             for i in range(n - 1, max(n - SWEEP_LOOKBACK, 1), -1):
                 c    = ltf[i]
                 body = abs(c["c"] - c["o"])
-                wick = min(c["o"], c["c"]) - c["l"]   # wick bawah
+                wick = min(c["o"], c["c"]) - c["l"]
+                if poi["ob_b"] <= c["l"] <= poi["fvg_t"] and \
+                   ((wick >= body * WICK_RATIO) or (c["c"] > c["o"] and wick > 0)):
+                    sweep_idx, sweep_c = i, c; break
+            if sweep_idx is None: return False
 
-                in_zone  = poi["ob_b"] <= c["l"] <= poi["fvg_t"]
-                rejected = (wick >= body * WICK_RATIO) or \
-                           (c["c"] > c["o"] and wick > 0)   # bullish + ada wick
-
-                if in_zone and rejected:
-                    sweep_idx, sweep_c = i, c
-                    break
-
-            if sweep_idx is None:
-                return False
-
-            # ── STEP 2: Swing High sebelum sweep ───────────────────────────
-            # Cari swing high terakhir dalam SWING_LOOKBACK candle sebelum sweep.
-            # Ini adalah level yang akan "dibreak" oleh BOS.
             s_start = max(0, sweep_idx - SWING_LOOKBACK)
-            swing_highs = [
-                ltf[i] for i in range(s_start + 1, sweep_idx)
-                if ltf[i]["h"] > ltf[i-1]["h"] and ltf[i]["h"] > ltf[i+1]["h"]
-            ]
-            if not swing_highs:
-                return False
+            swing_highs = [ltf[i] for i in range(s_start+1, sweep_idx)
+                           if ltf[i]["h"] > ltf[i-1]["h"] and ltf[i]["h"] > ltf[i+1]["h"]]
+            if not swing_highs: return False
             last_swing_high = swing_highs[-1]
 
-            # ── STEP 3: BOS / ChoCh ────────────────────────────────────────
-            # Candle setelah sweep yang:
-            #   a. Close > swing high (tembus struktur)
-            #   b. Bullish (close > open)
-            #   c. Body minimal MIN_BODY_PCT% → ada momentum, bukan doji
-            #   d. Tidak basi (dalam BOS_STALE_LIMIT candle terakhir)
             choch_idx = -1
             for i in range(sweep_idx + 1, n):
                 c        = ltf[i]
                 body_pct = (c["c"] - c["o"]) / c["o"] * 100 if c["o"] > 0 else 0
                 if c["c"] > last_swing_high["h"] and c["c"] > c["o"] and body_pct >= MIN_BODY_PCT:
-                    choch_idx = i
-                    break
+                    choch_idx = i; break
+            if choch_idx == -1: return False
+            if choch_idx < n - BOS_STALE_LIMIT: return False
 
-            if choch_idx == -1:
-                return False
-            if choch_idx < n - BOS_STALE_LIMIT:
-                return False    # BOS sudah terlalu lama, skip
-
-            # ── STEP 4: LTF FVG Bullish ────────────────────────────────────
-            # Cari FVG dari choch MUNDUR ke sweep (kanan → kiri).
-            # Ini memastikan FVG yang diambil adalah yang paling fresh/dekat BOS.
-            # FVG Bullish: gap antara high[i] dan low[i+2] (c0.h < c2.l)
             ltf_fvg_b, ltf_fvg_t = None, None
             for i in range(choch_idx - 2, sweep_idx - 1, -1):
                 if i < 0 or i + 2 >= n: continue
                 c0, c2 = ltf[i], ltf[i+2]
                 if c0["h"] < c2["l"]:
-                    ltf_fvg_b = c0["h"]   # Batas bawah FVG
-                    ltf_fvg_t = c2["l"]   # Batas atas FVG = entry (price pullback ke sini)
-                    break
-
-            # Fallback: Order Block — candle bearish terakhir sebelum impulse BOS
-            # (Tidak ada FVG → harga bergerak terlalu kuat tanpa gap)
+                    ltf_fvg_b = c0["h"]; ltf_fvg_t = c2["l"]; break
             if ltf_fvg_t is None:
                 for i in range(choch_idx - 1, sweep_idx - 1, -1):
                     if i < 0: continue
-                    c = ltf[i]
-                    if c["c"] < c["o"]:    # candle merah = OB bullish
-                        ltf_fvg_t = c["h"]
-                        ltf_fvg_b = c["l"]
-                        break
+                    if ltf[i]["c"] < ltf[i]["o"]:
+                        ltf_fvg_t = ltf[i]["h"]; ltf_fvg_b = ltf[i]["l"]; break
+            if ltf_fvg_t is None: return False
 
-            # Tidak ada FVG maupun OB → sinyal tidak valid, tolak
-            if ltf_fvg_t is None:
-                return False
+            self.entry = ltf_fvg_t
+            self.sl    = sweep_c["l"] - (sweep_c["l"] * SL_BUFFER_PCT / 100)
+            if self.sl >= self.entry: return False
 
-            # ── STEP 5: Entry / SL / TP / RR ──────────────────────────────
-            self.entry = ltf_fvg_t                                          # limit order di batas atas FVG
-            self.sl    = sweep_c["l"] - (sweep_c["l"] * SL_BUFFER_PCT / 100)  # di bawah sweep low
-
-            if self.sl >= self.entry:
-                return False
-
-            # TP = swing high terdekat di konfirmasi TF
-            # Jika tidak ada → tolak (tidak pakai arbitrary 2x RR fallback)
             self.tp = get_target(c_conf, self.direction)
-            if not self.tp or self.tp <= self.entry:
-                return False
+            if not self.tp or self.tp <= self.entry: return False
 
-            risk   = self.entry - self.sl
-            reward = self.tp    - self.entry
+            risk = self.entry - self.sl; reward = self.tp - self.entry
             if risk > 0 and reward / risk >= MIN_RR:
-                self.state            = "PLACING_ORDER"
-                self.last_signal_time = time.time()
-                self.place_limit_and_sl()
-                return True
+                self.state = "PLACING_ORDER"; self.last_signal_time = time.time()
+                self.place_limit_and_sl(); return True
 
-        # ------------------------------------------------------------------
-        # ████  SELL  ████
-        # ------------------------------------------------------------------
+        # ── SELL ──
         elif self.direction == "SELL":
-
-            # ── STEP 1: Sweep ──────────────────────────────────────────────
-            # High candle masuk zona POI (fvg_b ≤ high ≤ ob_t)
-            # dengan wick atas ≥ WICK_RATIO × body.
             sweep_idx, sweep_c = None, None
             for i in range(n - 1, max(n - SWEEP_LOOKBACK, 1), -1):
                 c    = ltf[i]
                 body = abs(c["c"] - c["o"])
-                wick = c["h"] - max(c["o"], c["c"])    # wick atas
+                wick = c["h"] - max(c["o"], c["c"])
+                if poi["fvg_b"] <= c["h"] <= poi["ob_t"] and \
+                   ((wick >= body * WICK_RATIO) or (c["c"] < c["o"] and wick > 0)):
+                    sweep_idx, sweep_c = i, c; break
+            if sweep_idx is None: return False
 
-                in_zone  = poi["fvg_b"] <= c["h"] <= poi["ob_t"]
-                rejected = (wick >= body * WICK_RATIO) or \
-                           (c["c"] < c["o"] and wick > 0)   # bearish + ada wick
-
-                if in_zone and rejected:
-                    sweep_idx, sweep_c = i, c
-                    break
-
-            if sweep_idx is None:
-                return False
-
-            # ── STEP 2: Swing Low sebelum sweep ────────────────────────────
             s_start = max(0, sweep_idx - SWING_LOOKBACK)
-            swing_lows = [
-                ltf[i] for i in range(s_start + 1, sweep_idx)
-                if ltf[i]["l"] < ltf[i-1]["l"] and ltf[i]["l"] < ltf[i+1]["l"]
-            ]
-            if not swing_lows:
-                return False
+            swing_lows = [ltf[i] for i in range(s_start+1, sweep_idx)
+                          if ltf[i]["l"] < ltf[i-1]["l"] and ltf[i]["l"] < ltf[i+1]["l"]]
+            if not swing_lows: return False
             last_swing_low = swing_lows[-1]
 
-            # ── STEP 3: BOS / ChoCh ────────────────────────────────────────
-            # Candle setelah sweep yang:
-            #   a. Close < swing low (tembus struktur ke bawah)
-            #   b. Bearish (close < open)
-            #   c. Body minimal MIN_BODY_PCT%
-            #   d. Dalam BOS_STALE_LIMIT candle terakhir
             choch_idx = -1
             for i in range(sweep_idx + 1, n):
                 c        = ltf[i]
                 body_pct = (c["o"] - c["c"]) / c["o"] * 100 if c["o"] > 0 else 0
                 if c["c"] < last_swing_low["l"] and c["c"] < c["o"] and body_pct >= MIN_BODY_PCT:
-                    choch_idx = i
-                    break
+                    choch_idx = i; break
+            if choch_idx == -1: return False
+            if choch_idx < n - BOS_STALE_LIMIT: return False
 
-            if choch_idx == -1:
-                return False
-            if choch_idx < n - BOS_STALE_LIMIT:
-                return False
-
-            # ── STEP 4: LTF FVG Bearish ────────────────────────────────────
-            # FVG Bearish: gap antara low[i] dan high[i+2] (c0.l > c2.h)
-            # Dicari MUNDUR dari choch ke sweep.
             ltf_fvg_b, ltf_fvg_t = None, None
             for i in range(choch_idx - 2, sweep_idx - 1, -1):
                 if i < 0 or i + 2 >= n: continue
                 c0, c2 = ltf[i], ltf[i+2]
                 if c0["l"] > c2["h"]:
-                    ltf_fvg_t = c0["l"]   # Batas atas FVG
-                    ltf_fvg_b = c2["h"]   # Batas bawah FVG = entry (price pullback ke sini)
-                    break
-
-            # Fallback: OB Bearish — candle bullish terakhir sebelum impulse BOS
+                    ltf_fvg_t = c0["l"]; ltf_fvg_b = c2["h"]; break
             if ltf_fvg_b is None:
                 for i in range(choch_idx - 1, sweep_idx - 1, -1):
                     if i < 0: continue
-                    c = ltf[i]
-                    if c["c"] > c["o"]:    # candle hijau = OB bearish
-                        ltf_fvg_b = c["l"]
-                        ltf_fvg_t = c["h"]
-                        break
+                    if ltf[i]["c"] > ltf[i]["o"]:
+                        ltf_fvg_b = ltf[i]["l"]; ltf_fvg_t = ltf[i]["h"]; break
+            if ltf_fvg_b is None: return False
 
-            if ltf_fvg_b is None:
-                return False
-
-            # ── STEP 5: Entry / SL / TP / RR ──────────────────────────────
-            self.entry = ltf_fvg_b                                          # limit sell di batas bawah FVG
-            self.sl    = sweep_c["h"] + (sweep_c["h"] * SL_BUFFER_PCT / 100)  # di atas sweep high
-
-            if self.sl <= self.entry:
-                return False
+            self.entry = ltf_fvg_b
+            self.sl    = sweep_c["h"] + (sweep_c["h"] * SL_BUFFER_PCT / 100)
+            if self.sl <= self.entry: return False
 
             self.tp = get_target(c_conf, self.direction)
-            if not self.tp or self.tp >= self.entry:
-                return False
+            if not self.tp or self.tp >= self.entry: return False
 
-            risk   = self.sl    - self.entry
-            reward = self.entry - self.tp
+            risk = self.sl - self.entry; reward = self.entry - self.tp
             if risk > 0 and reward / risk >= MIN_RR:
-                self.state            = "PLACING_ORDER"
-                self.last_signal_time = time.time()
-                self.place_limit_and_sl()
-                return True
+                self.state = "PLACING_ORDER"; self.last_signal_time = time.time()
+                self.place_limit_and_sl(); return True
 
         return False
 
@@ -455,28 +379,24 @@ class Engine:
             if (self.mode == "1H_BIAS" and not config["ENABLE_1H"]) or \
                (self.mode == "4H_BIAS" and not config["ENABLE_4H"]):
                 if self.state != "IDLE":
-                    self.cancel_pending_orders()
-                    self.reset()
+                    self.cancel_pending_orders(); self.reset()
                 return
 
             if self.symbol in positions: return
 
-            # Snapshot deque → list sekali, aman dari write bersamaan
-            c_p = list(klines_data[self.symbol][self.tf_poi])
-            c_c = list(klines_data[self.symbol][self.tf_conf])
-            c_t = list(klines_data[self.symbol][self.tf_trig])
+            c_p   = list(klines_data[self.symbol][self.tf_poi])
+            c_c   = list(klines_data[self.symbol][self.tf_conf])
+            c_t   = list(klines_data[self.symbol][self.tf_trig])
             price = live_prices[self.symbol]
 
             if not c_p or price == 0: return
             if time.time() - self.last_signal_time < self.cooldown and self.state == "IDLE": return
 
-            # Setup timeout 1 jam
             if self.setup_time and time.time() - self.setup_time > 3600:
                 if self.state in ["WAIT_C1","WAIT_C2","WAIT_C3","WAIT_OB_TOUCH"]:
                     if self.active_poi: self._append_ignored(self.active_poi["t"])
                     self.reset(); return
 
-            # Limit order timeout 2 jam
             if self.state == "WAIT_ENTRY" and time.time() - self.last_signal_time > 7200:
                 send_telegram(f"⏳ <b>{self.symbol}</b> [{self.mode}] Batal: Limit kadaluarsa (2 Jam).")
                 self.cancel_pending_orders()
@@ -489,11 +409,11 @@ class Engine:
                     in_fvg = poi["fvg_b"] <= price <= poi["fvg_t"]
                     in_ob  = poi["ob_b"]  <= price <= poi["ob_t"]
                     if in_fvg or in_ob:
-                        self.direction  = poi["dir"]
-                        self.active_poi = poi
+                        self.direction   = poi["dir"]
+                        self.active_poi  = poi
                         self.active_zone = "FVG" if in_fvg else "OB"
-                        self.state      = "WAIT_C1"
-                        self.setup_time = time.time()
+                        self.state       = "WAIT_C1"
+                        self.setup_time  = time.time()
                         return
 
             elif self.state == "WAIT_OB_TOUCH":
@@ -553,8 +473,7 @@ class Engine:
                 if hit_buy or hit_sell:
                     send_telegram(f"❌ <b>{self.symbol}</b> [{self.mode}] Batal: Harga lari ke TP/SL duluan.")
                     self.cancel_pending_orders()
-                    self._append_ignored(self.active_poi["t"])
-                    self.reset()
+                    self._append_ignored(self.active_poi["t"]); self.reset()
 
     # ==========================================================================
     # ORDER PLACEMENT
@@ -565,13 +484,10 @@ class Engine:
                 p     = precisions.get(self.symbol)
                 q_str = round_v((MARGIN_USDT * LEVERAGE) / self.entry, p["step"])
                 q_f   = float(q_str)
-
                 if q_f < p["min_qty"] or (q_f * self.entry) < p["min_notional"]:
-                    with self.lock: self.reset()
-                    return
+                    with self.lock: self.reset(); return
 
                 post_api({"symbol": self.symbol, "leverage": LEVERAGE}, "/fapi/v1/leverage")
-
                 with state_lock:
                     active_signals[self.symbol] = {
                         "mode": self.mode, "tp": self.tp,
@@ -589,7 +505,7 @@ class Engine:
                         self.pending_order_id = res["orderId"]
                         self.state = "WAIT_ENTRY"
 
-                    opp = "SELL" if self.direction == "BUY" else "BUY"
+                    opp    = "SELL" if self.direction == "BUY" else "BUY"
                     sl_res = post_api({
                         "symbol": self.symbol, "side": opp,
                         "algoType": "CONDITIONAL", "type": "STOP_MARKET",
@@ -624,7 +540,7 @@ class Engine:
     def cancel_pending_orders(self):
         oid, aid, sym = self.pending_order_id, self.pending_sl_algo_id, self.symbol
         def run():
-            if oid: post_api({"symbol": sym, "orderId": oid}, "/fapi/v1/order",    method="DELETE")
+            if oid: post_api({"symbol": sym, "orderId": oid}, "/fapi/v1/order",     method="DELETE")
             if aid: post_api({"symbol": sym, "algoId":  aid}, "/fapi/v1/algoOrder", method="DELETE")
             with state_lock: active_signals.pop(sym, None)
         threading.Thread(target=run, daemon=True).start()
@@ -651,44 +567,47 @@ def telegram_cmd():
                 txt   = txt.strip().lower()
                 parts = txt.split()
                 cmd   = parts[0]
-                rep   = send_telegram
 
                 if cmd == "/setapi" and len(parts) > 1:
                     API_KEY = parts[1]; update_env_file("BINANCE_API_KEY", API_KEY)
-                    rep("✅ API KEY diperbarui!")
+                    send_telegram("✅ API KEY diperbarui!")
                 elif cmd == "/setsecret" and len(parts) > 1:
                     SECRET_KEY = parts[1]; update_env_file("BINANCE_SECRET_KEY", SECRET_KEY)
-                    rep("✅ SECRET KEY diperbarui!")
+                    send_telegram("✅ SECRET KEY diperbarui!")
                 elif cmd == "/margin" and len(parts) > 1:
-                    try: MARGIN_USDT = float(parts[1]); update_env_file("MARGIN_USDT", MARGIN_USDT); rep(f"✅ Margin: <b>{MARGIN_USDT} USDT</b>")
-                    except: rep("⚠️ Format angka salah.")
+                    try: MARGIN_USDT = float(parts[1]); update_env_file("MARGIN_USDT", MARGIN_USDT); send_telegram(f"✅ Margin: <b>{MARGIN_USDT} USDT</b>")
+                    except: send_telegram("⚠️ Format angka salah.")
                 elif cmd == "/leverage" and len(parts) > 1:
-                    try: LEVERAGE = int(parts[1]); update_env_file("LEVERAGE", LEVERAGE); rep(f"✅ Leverage: <b>{LEVERAGE}x</b>")
-                    except: rep("⚠️ Format angka salah.")
+                    try: LEVERAGE = int(parts[1]); update_env_file("LEVERAGE", LEVERAGE); send_telegram(f"✅ Leverage: <b>{LEVERAGE}x</b>")
+                    except: send_telegram("⚠️ Format angka salah.")
                 elif cmd == "/buffer" and len(parts) > 1:
-                    try: SL_BUFFER_PCT = float(parts[1]); update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT); rep(f"✅ SL Buffer: <b>{SL_BUFFER_PCT}%</b>")
-                    except: rep("⚠️ Format angka salah.")
+                    try: SL_BUFFER_PCT = float(parts[1]); update_env_file("SL_BUFFER_PCT", SL_BUFFER_PCT); send_telegram(f"✅ SL Buffer: <b>{SL_BUFFER_PCT}%</b>")
+                    except: send_telegram("⚠️ Format angka salah.")
                 elif cmd == "/minrr" and len(parts) > 1:
-                    try: MIN_RR = float(parts[1]); update_env_file("MIN_RR", MIN_RR); rep(f"✅ Min RR: <b>{MIN_RR}</b>")
-                    except: rep("⚠️ Format angka salah.")
+                    try: MIN_RR = float(parts[1]); update_env_file("MIN_RR", MIN_RR); send_telegram(f"✅ Min RR: <b>{MIN_RR}</b>")
+                    except: send_telegram("⚠️ Format angka salah.")
                 elif txt.startswith("/pnl"):
                     tot = total_wins + total_losses
                     wr  = (total_wins / tot * 100) if tot > 0 else 0
                     mode_str = "DOUBLE" if config["ENABLE_1H"] and config["ENABLE_4H"] \
                                else "1H BIAS" if config["ENABLE_1H"] else "4H BIAS"
-                    rep(f"📊 <b>PnL {current_month_str}</b>\n"
+                    send_telegram(
+                        f"📊 <b>PnL {current_month_str}</b>\n"
                         f"💰 Total: <code>{total_pnl:.4f} USDT</code>\n"
                         f"📈 Winrate: {wr:.1f}% | ✅ {total_wins} | ❌ {total_losses}\n"
-                        f"⚙️ Mode: {mode_str}")
+                        f"⚙️ Mode: {mode_str}"
+                    )
                 elif txt in ["/mode 1h", "/mode 4h", "/mode double"]:
                     config["ENABLE_1H"] = txt in ["/mode 1h", "/mode double"]
                     config["ENABLE_4H"] = txt in ["/mode 4h", "/mode double"]
                     for e in engines: e.cancel_pending_orders(); e.safe_reset_from_outside()
-                    rep(f"✅ Mode: {txt.upper()}")
+                    send_telegram(f"✅ Mode: {txt.upper()}")
                 elif txt.startswith("/status"):
-                    lines = ["📊 <b>STATUS BOT</b>\n",
-                             f"⚙️ Modal: {MARGIN_USDT} USDT | Lev: {LEVERAGE}x | Buffer: {SL_BUFFER_PCT}%\n",
-                             "━━━━━━━━━━━━━━━━━━━\n📈 <b>POSISI FLOATING</b>\n━━━━━━━━━━━━━━━━━━━\n"]
+                    lines = [
+                        "📊 <b>STATUS BOT</b>\n",
+                        f"⚙️ Modal: {MARGIN_USDT} USDT | Lev: {LEVERAGE}x | Buffer: {SL_BUFFER_PCT}%\n",
+                        "━━━━━━━━━━━━━━━━━━━\n📈 <b>POSISI FLOATING</b>\n━━━━━━━━━━━━━━━━━━━\n"
+                    ]
                     with state_lock: pos_snap = dict(positions)
                     if pos_snap:
                         for s, p in pos_snap.items():
@@ -698,7 +617,7 @@ def telegram_cmd():
                             pct = (pnl / mg * 100) if mg > 0 else 0
                             sgn = "+" if pnl > 0 else ""
                             pr  = precisions.get(s, {}); tick = pr.get("tick", 4) if pr else 4
-                            tp_v, sl_v = None, None
+                            tp_v = sl_v = None
                             for api_ep in ["/fapi/v1/openOrders", "/fapi/v1/openAlgoOrders"]:
                                 orders = post_api({"symbol": s}, api_ep, method="GET")
                                 if isinstance(orders, list):
@@ -714,12 +633,17 @@ def telegram_cmd():
                                 if risk > 0: rr_str = f"1:{reward/risk:.2f}"
                             lines.append(
                                 f"{'🟩' if pnl>0 else '🟥'} <b>{s}</b> ({p['side']})\n"
-                                f"   Entry: <code>{p['ep']}</code> | TP: <code>{round_v(tp_v,tick) if tp_v else '-'}</code> | SL: <code>{round_v(sl_v,tick) if sl_v else '-'}</code>\n"
-                                f"   PnL: <code>{sgn}{pnl:.2f} USDT ({sgn}{pct:.2f}%)</code> | RR: <code>{rr_str}</code>\n"
+                                f"   Entry: <code>{p['ep']}</code> | "
+                                f"TP: <code>{round_v(tp_v,tick) if tp_v else '-'}</code> | "
+                                f"SL: <code>{round_v(sl_v,tick) if sl_v else '-'}</code>\n"
+                                f"   PnL: <code>{sgn}{pnl:.2f} USDT ({sgn}{pct:.2f}%)</code> | "
+                                f"RR: <code>{rr_str}</code>\n"
                             )
-                    else: lines.append("💤 Tidak ada posisi aktif.\n")
+                    else:
+                        lines.append("💤 Tidak ada posisi aktif.\n")
+
                     lines.append("━━━━━━━━━━━━━━━━━━━\n🔍 <b>ANALISA AKTIF</b>\n━━━━━━━━━━━━━━━━━━━\n")
-                    active_e = [e for e in engines if e.state not in ["IDLE"]]
+                    active_e = [e for e in engines if e.state != "IDLE"]
                     if active_e:
                         for e in active_e:
                             tf  = "1H" if "1H" in e.mode else "4H"
@@ -736,8 +660,9 @@ def telegram_cmd():
                             if e.sl:    ln += f" | SL: <code>{round_v(e.sl,tick)}</code>"
                             ln += f" | RR: <code>{rr_str}</code>"
                             lines.append(ln + "\n")
-                    else: lines.append("💤 Semua koin IDLE.\n")
-                    rep("\n".join(lines).strip())
+                    else:
+                        lines.append("💤 Semua koin IDLE.\n")
+                    send_telegram("\n".join(lines).strip())
 
                 elif txt.startswith("/close"):
                     tgt = txt.replace("/close","").strip().upper()
@@ -752,7 +677,7 @@ def telegram_cmd():
                                   "reduceOnly":"true"}, "/fapi/v1/order")
                         post_api({"symbol":s}, "/fapi/v1/allOpenOrders",  method="DELETE")
                         post_api({"symbol":s}, "/fapi/v1/algoOpenOrders", method="DELETE")
-                        rep(f"🛑 {s} ditutup paksa.")
+                        send_telegram(f"🛑 {s} ditutup paksa.")
 
                 elif txt.startswith("/bep"):
                     tgt = txt.replace("/bep","").strip().upper()
@@ -774,21 +699,22 @@ def telegram_cmd():
                                             post_api({"symbol":s,"algoId":o.get("algoId")}, "/fapi/v1/algoOrder", method="DELETE")
                         sl_p = {"symbol":s,"side":"SELL" if p["side"]=="BUY" else "BUY",
                                 "type":"STOP_MARKET","stopPrice":round_v(p["ep"],pr["tick"]),"closePosition":"true"}
-                        res_sl = post_api(sl_p, "/fapi/v1/order")
-                        if "code" in res_sl:
+                        if "code" in post_api(sl_p, "/fapi/v1/order"):
                             sl_p.pop("stopPrice"); sl_p.update({"algoType":"CONDITIONAL","triggerPrice":round_v(p["ep"],pr["tick"])})
                             post_api(sl_p, "/fapi/v1/algoOrder")
-                        rep(f"🛡️ {s} SL dipindah ke BEP.")
+                        send_telegram(f"🛡️ {s} SL dipindah ke BEP.")
 
                 elif txt.startswith("/help"):
-                    rep("<b>📖 COMMANDS:</b>\n"
+                    send_telegram(
+                        "<b>📖 COMMANDS:</b>\n"
                         "<code>/margin /leverage /buffer /minrr</code> — Parameter\n"
                         "<code>/setapi /setsecret</code> — API Keys\n"
                         "<code>/status</code> — Status bot\n"
                         "<code>/pnl</code> — PnL bulan ini\n"
                         "<code>/mode 1h|4h|double</code> — Mode\n"
                         "<code>/close koin|all</code> — Tutup posisi\n"
-                        "<code>/bep koin|all</code> — SL ke entry")
+                        "<code>/bep koin|all</code> — SL ke entry"
+                    )
         except Exception as e:
             logger.warning(f"telegram_cmd: {e}"); time.sleep(5)
 
@@ -806,7 +732,7 @@ def load_monthly_pnl():
     except: pass
 
 # ==============================================================================
-# WEBSOCKET
+# WEBSOCKET & STARTUP
 # ==============================================================================
 def keep_alive_listenkey():
     while True:
@@ -840,21 +766,23 @@ def on_user_msg(ws, m):
                 for e in engines:
                     if e.symbol == s and e.pending_sl_algo_id:
                         post_api({"symbol":s,"algoId":e.pending_sl_algo_id}, "/fapi/v1/algoOrder", method="DELETE")
-                sl_p = {"symbol":s,"side":opp,"type":"STOP_MARKET","stopPrice":round_v(sig["sl"],pr.get("tick",4)),"closePosition":"true"}
+                sl_p = {"symbol":s,"side":opp,"type":"STOP_MARKET",
+                        "stopPrice":round_v(sig["sl"],pr.get("tick",4)),"closePosition":"true"}
                 if "code" in post_api(sl_p, "/fapi/v1/order"):
                     sl_p.pop("stopPrice"); sl_p.update({"algoType":"CONDITIONAL","triggerPrice":round_v(sig["sl"],pr.get("tick",4))})
                     post_api(sl_p, "/fapi/v1/algoOrder")
-                tp_p = {"symbol":s,"side":opp,"type":"TAKE_PROFIT_MARKET","stopPrice":round_v(sig["tp"],pr.get("tick",4)),"closePosition":"true"}
+                tp_p = {"symbol":s,"side":opp,"type":"TAKE_PROFIT_MARKET",
+                        "stopPrice":round_v(sig["tp"],pr.get("tick",4)),"closePosition":"true"}
                 if "code" in post_api(tp_p, "/fapi/v1/order"):
                     tp_p.pop("stopPrice"); tp_p.update({"algoType":"CONDITIONAL","triggerPrice":round_v(sig["tp"],pr.get("tick",4))})
                     post_api(tp_p, "/fapi/v1/algoOrder")
                 send_telegram(f"🚀 <b>{s}</b> LIMIT FILLED! TP/SL auto-attached.")
 
-            if o["X"] == "FILLED" and float(o.get("rp",0)) != 0:
+            if o["X"] == "FILLED" and float(o.get("rp", 0)) != 0:
                 rp = float(o["rp"]); total_pnl += rp
                 if rp > 0: total_wins += 1
                 else: total_losses += 1
-                ot = o.get("ot", o.get("o"))
+                ot     = o.get("ot", o.get("o"))
                 reason = "Hit TP 🎯" if ot in ["TAKE_PROFIT_MARKET","TAKE_PROFIT"] else "Hit SL 🛑"
                 log_trade(s, o["S"], rp, active_signals.get(s, {}).get("mode","UNKNOWN"))
                 send_telegram(f"{'✅' if rp>0 else '❌'} <b>{s}</b> CLOSED | {reason} | PnL: <code>{rp:+.4f} USDT</code>")
@@ -921,6 +849,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v9.3 (SMC LOGIC FIXED) ACTIVE...")
+    print("🔥 BOT v9.4 (FVG FRESH DETECTION FIX) ACTIVE...")
     while True:
         time.sleep(1)
