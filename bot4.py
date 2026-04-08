@@ -404,17 +404,63 @@ class Engine:
                 self.reset(); return
 
             if self.state == "IDLE":
+                # [V9.5 FIX] Deteksi wick yang menyentuh zona lalu memantul keluar
+                # di dalam 1 candle — "Mata Buta" / Blindspot fix.
+                # Selain cek harga live, sekarang juga cek high/low candle trigger
+                # terakhir (sudah close) untuk menangkap wick yang sudah memantul.
+                curr_k = c_t[-1] if c_t else None
+
                 for poi in reversed(get_unmitigated_poi(c_p)):
                     if poi["t"] in self.ignored_pois: continue
-                    in_fvg = poi["fvg_b"] <= price <= poi["fvg_t"]
-                    in_ob  = poi["ob_b"]  <= price <= poi["ob_t"]
-                    if in_fvg or in_ob:
-                        self.direction   = poi["dir"]
-                        self.active_poi  = poi
-                        self.active_zone = "FVG" if in_fvg else "OB"
-                        self.state       = "WAIT_C1"
-                        self.setup_time  = time.time()
-                        return
+
+                    if poi["dir"] == "BUY":
+                        # Harga live di dalam zona (kondisi normal)
+                        price_in_zone = poi["ob_b"] <= price <= poi["fvg_t"]
+
+                        # Wick candle terakhir sempat masuk zona, harga sudah
+                        # memantul keluar ke atas — bot harus tetap masuk WAIT_C1
+                        wick_touched = (
+                            curr_k is not None and
+                            curr_k["l"] <= poi["fvg_t"] and  # wick menyentuh/masuk FVG
+                            price >= poi["ob_b"]              # harga belum invalidasi zona
+                        )
+
+                        if price_in_zone or wick_touched:
+                            # Tentukan lapisan zona yang tersentuh
+                            if price <= poi["fvg_t"] or (curr_k and curr_k["l"] <= poi["fvg_t"]):
+                                active_zone = "FVG"
+                            else:
+                                active_zone = "OB"
+                            self.direction   = poi["dir"]
+                            self.active_poi  = poi
+                            self.active_zone = active_zone
+                            self.state       = "WAIT_C1"
+                            self.setup_time  = time.time()
+                            return
+
+                    elif poi["dir"] == "SELL":
+                        # Harga live di dalam zona (kondisi normal)
+                        price_in_zone = poi["fvg_b"] <= price <= poi["ob_t"]
+
+                        # Wick candle terakhir sempat masuk zona, harga sudah
+                        # memantul keluar ke bawah
+                        wick_touched = (
+                            curr_k is not None and
+                            curr_k["h"] >= poi["fvg_b"] and  # wick menyentuh/masuk FVG
+                            price <= poi["ob_t"]              # harga belum invalidasi zona
+                        )
+
+                        if price_in_zone or wick_touched:
+                            if price >= poi["fvg_b"] or (curr_k and curr_k["h"] >= poi["fvg_b"]):
+                                active_zone = "FVG"
+                            else:
+                                active_zone = "OB"
+                            self.direction   = poi["dir"]
+                            self.active_poi  = poi
+                            self.active_zone = active_zone
+                            self.state       = "WAIT_C1"
+                            self.setup_time  = time.time()
+                            return
 
             elif self.state == "WAIT_OB_TOUCH":
                 poi = self.active_poi
@@ -849,6 +895,6 @@ engines = [Engine(s, m) for s in symbols for m in ["1H_BIAS", "4H_BIAS"]]
 
 if __name__ == "__main__":
     start()
-    print("🔥 BOT v9.4 (FVG FRESH DETECTION FIX) ACTIVE...")
+    print("🔥 BOT v9.5 (BLINDSPOT FIX + FVG FRESH DETECTION) ACTIVE...")
     while True:
         time.sleep(1)
