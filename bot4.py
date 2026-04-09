@@ -828,8 +828,17 @@ def on_user_msg(ws, m):
                 rp = float(o["rp"]); total_pnl += rp
                 if rp > 0: total_wins += 1
                 else: total_losses += 1
-                ot     = o.get("ot", o.get("o"))
-                reason = "Hit TP 🎯" if ot in ["TAKE_PROFIT_MARKET","TAKE_PROFIT"] else "Hit SL 🛑"
+                
+                # --- START THE TRUTH TELLER PATCH ---
+                ot = o.get("ot", o.get("o"))
+                if ot in ["TAKE_PROFIT_MARKET", "TAKE_PROFIT"]:
+                    reason = "Hit TP 🎯"
+                elif ot in ["STOP_MARKET", "STOP"]:
+                    reason = "Hit SL 🛑" if rp < 0 else "Hit BEP 🛡️"
+                else:
+                    reason = "Hit TP / Profit 🎯" if rp > 0 else "Hit SL / Loss 🛑"
+                # --- END THE TRUTH TELLER PATCH ---
+                
                 log_trade(s, o["S"], rp, active_signals.get(s, {}).get("mode","UNKNOWN"))
                 send_telegram(f"{'✅' if rp>0 else '❌'} <b>{s}</b> CLOSED | {reason} | PnL: <code>{rp:+.4f} USDT</code>")
 
